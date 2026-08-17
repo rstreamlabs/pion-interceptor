@@ -10,18 +10,43 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
 )
 
+// Decoder03 exposes the experimental FlexFEC-03 decoder behind a concurrency-safe API.
+type Decoder03 struct {
+	decoder *fecDecoder
+	mu      sync.Mutex
+}
+
+// NewDecoder03 creates a decoder for a FlexFEC SSRC and its protected media SSRC.
+func NewDecoder03(ssrc uint32, protectedStreamSSRC uint32, loggerFactory logging.LoggerFactory) *Decoder03 {
+	return &Decoder03{decoder: newFECDecoder(ssrc, protectedStreamSSRC, loggerFactory)}
+}
+
+// Decode records one media or FlexFEC packet and returns newly recovered media packets.
+func (d *Decoder03) Decode(receivedPacket rtp.Packet) ([]rtp.Packet, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.decoder.decodeFEC(receivedPacket)
+}
+
 // Static errors for the flexfec package.
 var (
+	// ErrInvalidPacket identifies a malformed or inconsistent FlexFEC repair packet.
+	ErrInvalidPacket                  = errors.New("invalid FlexFEC packet")
 	errPacketTruncated                = errors.New("packet truncated")
 	errRetransmissionBitSet           = errors.New("packet with retransmission bit set not supported")
 	errInflexibleGeneratorMatrix      = errors.New("packet with inflexible generator matrix not supported")
 	errMultipleSSRCProtection         = errors.New("multiple ssrc protection not supported")
 	errLastOptionalMaskKBitSetToFalse = errors.New("k-bit of last optional mask is set to false")
+	errUnknownProtectedSSRC           = errors.New("repair packet protects an unexpected SSRC")
+	errEmptyPacketMask                = errors.New("repair packet has an empty mask")
+	errInvalidRecoveryLength          = errors.New("recovered payload length exceeds repair payload")
 )
 
 // fecDecoder is a WIP implementation decoder used for testing purposes.
@@ -31,7 +56,7 @@ type fecDecoder struct {
 	protectedStreamSSRC uint32
 	maxMediaPackets     int
 	maxFECPackets       int
-	recoveredPackets    []rtp.Packet
+	recoveredPackets    []*rtp.Packet
 	receivedFECPackets  []fecPacketState
 }
 
@@ -42,13 +67,22 @@ func newFECDecoder(ssrc uint32, protectedStreamSSRC uint32, loggerFactory loggin
 		protectedStreamSSRC: protectedStreamSSRC,
 		maxMediaPackets:     100,
 		maxFECPackets:       100,
-		recoveredPackets:    make([]rtp.Packet, 0),
-		receivedFECPackets:  make([]fecPacketState, 0),
+		recoveredPackets:    make([]*rtp.Packet, 0, 192),
+		receivedFECPackets:  make([]fecPacketState, 0, 100),
 	}
 }
 
 func (d *fecDecoder) DecodeFec(receivedPacket rtp.Packet) []rtp.Packet {
-	if len(d.recoveredPackets) == d.maxMediaPackets {
+	recovered, err := d.decodeFEC(receivedPacket)
+	if err != nil {
+		d.logger.Errorf("failed to decode flexfec03 packet: %v", err)
+	}
+
+	return recovered
+}
+
+func (d *fecDecoder) decodeFEC(receivedPacket rtp.Packet) ([]rtp.Packet, error) {
+	if len(d.recoveredPackets) >= d.maxMediaPackets {
 		backRecoveredPacket := d.recoveredPackets[len(d.recoveredPackets)-1]
 		if backRecoveredPacket.SSRC == receivedPacket.SSRC {
 			seqDiffVal := seqDiff(receivedPacket.SequenceNumber, backRecoveredPacket.SequenceNumber)
@@ -60,12 +94,14 @@ func (d *fecDecoder) DecodeFec(receivedPacket rtp.Packet) []rtp.Packet {
 		}
 	}
 
-	d.insertPacket(receivedPacket)
+	if err := d.insertPacket(receivedPacket); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidPacket, err)
+	}
 
 	return d.attemptRecovery()
 }
 
-func (d *fecDecoder) insertPacket(receivedPkt rtp.Packet) {
+func (d *fecDecoder) insertPacket(receivedPkt rtp.Packet) error {
 	// Discard old FEC packets such that the sequence numbers in
 	// `received_fec_packets_` span at most 1/2 of the sequence number space.
 	// This is important for keeping `received_fec_packets_` sorted, and may
@@ -88,12 +124,15 @@ func (d *fecDecoder) insertPacket(receivedPkt rtp.Packet) {
 
 	switch receivedPkt.SSRC {
 	case d.ssrc:
-		d.insertFECPacket(receivedPkt)
+		if err := d.insertFECPacket(receivedPkt); err != nil {
+			return err
+		}
 	case d.protectedStreamSSRC:
 		d.insertMediaPacket(receivedPkt)
 	}
-
 	d.discardOldRecoveredPackets()
+
+	return nil
 }
 
 func (d *fecDecoder) insertMediaPacket(receivedPkt rtp.Packet) {
@@ -102,42 +141,45 @@ func (d *fecDecoder) insertMediaPacket(receivedPkt rtp.Packet) {
 			return
 		}
 	}
-
-	d.recoveredPackets = append(d.recoveredPackets, receivedPkt)
-	sort.Slice(d.recoveredPackets, func(i, j int) bool {
-		return isNewerSeq(d.recoveredPackets[i].SequenceNumber, d.recoveredPackets[j].SequenceNumber)
-	})
-	d.updateCoveringFecPackets(receivedPkt)
+	const retainedMediaPackets = 192
+	if len(d.recoveredPackets) == retainedMediaPackets {
+		copy(d.recoveredPackets, d.recoveredPackets[1:])
+		d.recoveredPackets = d.recoveredPackets[:retainedMediaPackets-1]
+	}
+	insertAt := len(d.recoveredPackets)
+	for insertAt > 0 && isNewerSeq(receivedPkt.SequenceNumber, d.recoveredPackets[insertAt-1].SequenceNumber) {
+		insertAt--
+	}
+	packet := receivedPkt
+	d.recoveredPackets = append(d.recoveredPackets, nil)
+	copy(d.recoveredPackets[insertAt+1:], d.recoveredPackets[insertAt:])
+	d.recoveredPackets[insertAt] = &packet
+	d.updateCoveringFecPackets(&packet)
 }
 
-func (d *fecDecoder) updateCoveringFecPackets(receivedPkt rtp.Packet) {
+func (d *fecDecoder) updateCoveringFecPackets(receivedPkt *rtp.Packet) {
 	for _, fecPkt := range d.receivedFECPackets {
 		for _, protectedPacket := range fecPkt.protectedPackets {
 			if protectedPacket.seq == receivedPkt.SequenceNumber {
-				protectedPacket.packet = &receivedPkt
+				protectedPacket.packet = receivedPkt
 			}
 		}
 	}
 }
 
-func (d *fecDecoder) insertFECPacket(fecPkt rtp.Packet) { //nolint:cyclop
+func (d *fecDecoder) insertFECPacket(fecPkt rtp.Packet) error { //nolint:cyclop
 	for _, existingFECPacket := range d.receivedFECPackets {
 		if existingFECPacket.packet.SequenceNumber == fecPkt.SequenceNumber {
-			return
+			return nil
 		}
 	}
 
 	fec, err := parseFlexFEC03Header(fecPkt.Payload)
 	if err != nil {
-		d.logger.Errorf("failed to parse flexfec03 header: %v", err)
-
-		return
+		return err
 	}
-
 	if fec.protectedSSRC != d.protectedStreamSSRC {
-		d.logger.Errorf("fec is protecting unknown ssrc, expected %d, got %d", fec.protectedSSRC, d.protectedStreamSSRC)
-
-		return
+		return fmt.Errorf("%w: expected %d, got %d", errUnknownProtectedSSRC, d.protectedStreamSSRC, fec.protectedSSRC)
 	}
 
 	protectedSeqs := decodeMask(uint64(fec.mask0), 15, fec.seqNumBase)
@@ -149,9 +191,7 @@ func (d *fecDecoder) insertFECPacket(fecPkt rtp.Packet) { //nolint:cyclop
 	}
 
 	if len(protectedSeqs) == 0 {
-		d.logger.Warn("empty fec packet mask")
-
-		return
+		return errEmptyPacketMask
 	}
 
 	protectedPackets := make([]*protectedPacket, 0, len(protectedSeqs))
@@ -171,7 +211,7 @@ func (d *fecDecoder) insertFECPacket(fecPkt rtp.Packet) { //nolint:cyclop
 		default:
 			protectedPackets = append(protectedPackets, &protectedPacket{
 				seq:    protectedSeqs[protectedSeqIt],
-				packet: &d.recoveredPackets[recoveredPacketIt],
+				packet: d.recoveredPackets[recoveredPacketIt],
 			})
 			protectedSeqIt++
 			recoveredPacketIt++
@@ -198,13 +238,16 @@ func (d *fecDecoder) insertFECPacket(fecPkt rtp.Packet) { //nolint:cyclop
 	if len(d.receivedFECPackets) > d.maxFECPackets {
 		d.receivedFECPackets = d.receivedFECPackets[1:]
 	}
+
+	return nil
 }
 
-func (d *fecDecoder) attemptRecovery() []rtp.Packet {
+func (d *fecDecoder) attemptRecovery() ([]rtp.Packet, error) {
 	recoveredPackets := make([]rtp.Packet, 0)
 	for {
 		packetsRecovered := 0
-		for _, fecPkt := range d.receivedFECPackets {
+		for fecIndex := 0; fecIndex < len(d.receivedFECPackets); fecIndex++ {
+			fecPkt := &d.receivedFECPackets[fecIndex]
 			packetsMissing := 0
 			for _, pkt := range fecPkt.protectedPackets {
 				if pkt.packet == nil {
@@ -219,18 +262,21 @@ func (d *fecDecoder) attemptRecovery() []rtp.Packet {
 				continue
 			}
 
-			recovered, err := d.recoverPacket(&fecPkt) //nolint:gosec
+			recovered, err := d.recoverPacket(fecPkt) //nolint:gosec
 			if err != nil {
-				d.logger.Errorf("failed to recover packet: %v", err)
-			}
+				copy(d.receivedFECPackets[fecIndex:], d.receivedFECPackets[fecIndex+1:])
+				d.receivedFECPackets[len(d.receivedFECPackets)-1] = fecPacketState{}
+				d.receivedFECPackets = d.receivedFECPackets[:len(d.receivedFECPackets)-1]
 
+				return recoveredPackets, fmt.Errorf("%w: recover packet: %w", ErrInvalidPacket, err)
+			}
 			recoveredPackets = append(recoveredPackets, recovered)
-			d.recoveredPackets = append(d.recoveredPackets, recovered)
+			recoveredCopy := recovered
+			d.recoveredPackets = append(d.recoveredPackets, &recoveredCopy)
 			sort.Slice(d.recoveredPackets, func(i, j int) bool {
 				return isNewerSeq(d.recoveredPackets[i].SequenceNumber, d.recoveredPackets[j].SequenceNumber)
 			})
-
-			d.updateCoveringFecPackets(recovered)
+			d.updateCoveringFecPackets(&recoveredCopy)
 			d.discardOldRecoveredPackets()
 			packetsRecovered++
 		}
@@ -240,7 +286,7 @@ func (d *fecDecoder) attemptRecovery() []rtp.Packet {
 		}
 	}
 
-	return recoveredPackets
+	return recoveredPackets, nil
 }
 
 func (d *fecDecoder) recoverPacket(fec *fecPacketState) (rtp.Packet, error) {
@@ -275,27 +321,21 @@ func (d *fecDecoder) recoverPacket(fec *fecPacketState) (rtp.Packet, error) {
 	headerRecovery[0] |= 0x80
 	headerRecovery[0] &= 0xbf
 	payloadLength := binary.BigEndian.Uint16(headerRecovery[2:4])
+	if err := validateRecoveryPayloadLength(payloadLength, len(fec.flexFec.payload)); err != nil {
+		return rtp.Packet{}, err
+	}
 	binary.BigEndian.PutUint16(headerRecovery[2:4], seqnum)
 	binary.BigEndian.PutUint32(headerRecovery[8:12], d.protectedStreamSSRC)
 
-	payloadRecovery := make([]byte, payloadLength)
-	copy(payloadRecovery, fec.flexFec.payload)
-	for _, protectedPacket := range fec.protectedPackets {
-		if protectedPacket.packet != nil {
-			packet, err := protectedPacket.packet.Marshal()
-			if err != nil {
-				return rtp.Packet{}, fmt.Errorf("marshal protected packet: %w", err)
-			}
-			for i := 0; i < min(int(payloadLength), len(packet)-12); i++ {
-				payloadRecovery[i] ^= packet[12+i]
-			}
-		}
+	payloadRecovery, err := recoverPayload(payloadLength, fec)
+	if err != nil {
+		return rtp.Packet{}, err
 	}
 
 	headerRecovery = append(headerRecovery, payloadRecovery...) //nolint:makezero
 
 	var packet rtp.Packet
-	err := packet.Unmarshal(headerRecovery)
+	err = packet.Unmarshal(headerRecovery)
 	if err != nil {
 		return rtp.Packet{}, fmt.Errorf("unmarshal recovered: %w", err)
 	}
@@ -303,10 +343,38 @@ func (d *fecDecoder) recoverPacket(fec *fecPacketState) (rtp.Packet, error) {
 	return packet, nil
 }
 
+func validateRecoveryPayloadLength(payloadLength uint16, repairPayloadLength int) error {
+	if int(payloadLength) > repairPayloadLength {
+		return fmt.Errorf("%w: got %d, maximum %d", errInvalidRecoveryLength, payloadLength, repairPayloadLength)
+	}
+
+	return nil
+}
+
+func recoverPayload(payloadLength uint16, fec *fecPacketState) ([]byte, error) {
+	payloadRecovery := make([]byte, payloadLength)
+	copy(payloadRecovery, fec.flexFec.payload)
+	for _, protectedPacket := range fec.protectedPackets {
+		if protectedPacket.packet == nil {
+			continue
+		}
+		packet, err := protectedPacket.packet.Marshal()
+		if err != nil {
+			return nil, fmt.Errorf("marshal protected packet: %w", err)
+		}
+		for i := 0; i < min(int(payloadLength), len(packet)-12); i++ {
+			payloadRecovery[i] ^= packet[12+i]
+		}
+	}
+
+	return payloadRecovery, nil
+}
+
 func (d *fecDecoder) discardOldRecoveredPackets() {
 	const limit = 192
 	if len(d.recoveredPackets) > limit {
-		d.recoveredPackets = d.recoveredPackets[len(d.recoveredPackets)-192:]
+		copy(d.recoveredPackets, d.recoveredPackets[len(d.recoveredPackets)-limit:])
+		d.recoveredPackets = d.recoveredPackets[:limit]
 	}
 }
 
