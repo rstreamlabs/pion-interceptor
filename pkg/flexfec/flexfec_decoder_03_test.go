@@ -5,6 +5,8 @@ package flexfec
 
 import (
 	"encoding/binary"
+	"errors"
+	"sync"
 	"testing"
 
 	"github.com/pion/logging"
@@ -35,7 +37,7 @@ func TestFECDecoderInsertPacketRemovesOldFEC(t *testing.T) {
 		Payload: buildTestFlexFecPayload(40000),
 	}
 
-	decoder.insertPacket(pkt)
+	require.NoError(t, decoder.insertPacket(pkt))
 
 	require.Len(t, decoder.receivedFECPackets, 2)
 	assert.Equal(t, uint16(25000), decoder.receivedFECPackets[0].packet.SequenceNumber)
@@ -59,13 +61,72 @@ func TestFECDecoderInsertPacketKeepsRecentFEC(t *testing.T) {
 		Payload: buildTestFlexFecPayload(2000),
 	}
 
-	decoder.insertPacket(pkt)
+	require.NoError(t, decoder.insertPacket(pkt))
 
 	require.Len(t, decoder.receivedFECPackets, len(initialStates)+1)
 	for i, state := range initialStates {
 		assert.Equal(t, state.packet.SequenceNumber, decoder.receivedFECPackets[i].packet.SequenceNumber)
 	}
 	assert.Equal(t, uint16(2000), decoder.receivedFECPackets[len(initialStates)].packet.SequenceNumber)
+}
+
+func TestDecoder03RecoversExactPacketAfterReorderedInput(t *testing.T) {
+	mediaPackets, fecPackets := generatePacketsWithFecCount(t, []uint16{1, 2, 3, 4, 5}, 1)
+	decoder := NewDecoder03(ssrc, protectedStreamSSRC, logging.NewDefaultLoggerFactory())
+	for _, packet := range []rtp.Packet{mediaPackets[4], fecPackets[0], mediaPackets[0], mediaPackets[1]} {
+		_, err := decoder.Decode(packet)
+		require.NoError(t, err)
+	}
+	recovered, err := decoder.Decode(mediaPackets[3])
+	require.NoError(t, err)
+	require.Len(t, recovered, 1)
+	assert.Equal(t, mediaPackets[2], recovered[0])
+}
+
+func TestDecoder03RejectsOversizedRecoveryWithoutFalsePacket(t *testing.T) {
+	mediaPackets, fecPackets := generatePacketsWithFecCount(t, []uint16{1, 2, 3, 4, 5}, 1)
+	malformed := fecPackets[0].Clone()
+	malformed.Payload[2] = 0xff
+	malformed.Payload[3] = 0xff
+	decoder := NewDecoder03(ssrc, protectedStreamSSRC, logging.NewDefaultLoggerFactory())
+	for _, packet := range []rtp.Packet{mediaPackets[0], *malformed, mediaPackets[1], mediaPackets[3]} {
+		_, err := decoder.Decode(packet)
+		require.NoError(t, err)
+	}
+	recovered, err := decoder.Decode(mediaPackets[4])
+	require.ErrorIs(t, err, ErrInvalidPacket)
+	assert.Empty(t, recovered)
+}
+
+func TestDecoder03RejectsMalformedPacketsAndSerializesCallers(t *testing.T) {
+	decoder := NewDecoder03(testDecoderSSRC, testProtectedStreamSSRC, logging.NewDefaultLoggerFactory())
+	recovered, err := decoder.Decode(rtp.Packet{Header: rtp.Header{SSRC: testDecoderSSRC}, Payload: []byte{1, 2, 3}})
+	require.ErrorIs(t, err, ErrInvalidPacket)
+	assert.Empty(t, recovered)
+	var workers sync.WaitGroup
+	errorsCh := make(chan error, 8)
+	for worker := range 8 {
+		workers.Add(1)
+		go func(offset int) {
+			defer workers.Done()
+			for index := offset; index < 1000; index += 8 {
+				sequenceNumber := uint16(index) //nolint:gosec // The loop is bounded below the uint16 limit.
+				_, decodeErr := decoder.Decode(rtp.Packet{
+					Header: rtp.Header{SSRC: testProtectedStreamSSRC, SequenceNumber: sequenceNumber},
+				})
+				if decodeErr != nil && !errors.Is(decodeErr, ErrInvalidPacket) {
+					errorsCh <- decodeErr
+
+					return
+				}
+			}
+		}(worker)
+	}
+	workers.Wait()
+	close(errorsCh)
+	for decodeErr := range errorsCh {
+		require.NoError(t, decodeErr)
+	}
 }
 
 func newFecPacketState(seq uint16) fecPacketState {
