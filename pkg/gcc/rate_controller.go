@@ -31,6 +31,7 @@ type rateController struct {
 	latestRTT          time.Duration
 	latestReceivedRate int
 	latestDecreaseRate *exponentialMovingAverage
+	recoveryTarget     int
 }
 
 type exponentialMovingAverage struct {
@@ -83,7 +84,7 @@ func (c *rateController) updateRTT(rtt time.Duration) {
 }
 
 func (c *rateController) onDelayStats(ds DelayStats) {
-	now := time.Now()
+	now := c.now()
 
 	if !c.init {
 		c.delayStats = ds
@@ -92,8 +93,9 @@ func (c *rateController) onDelayStats(ds DelayStats) {
 
 		return
 	}
+	previousState := c.delayStats.State
 	c.delayStats = ds
-	c.delayStats.State = c.delayStats.State.transition(ds.Usage)
+	c.delayStats.State = previousState.transition(ds.Usage)
 
 	if c.delayStats.State == stateHold {
 		return
@@ -119,7 +121,11 @@ func (c *rateController) onDelayStats(ds DelayStats) {
 		}
 
 	case stateDecrease:
+		previousTarget := c.target
 		c.target = clampInt(c.decrease(), c.minBitrate, c.maxBitrate)
+		if c.target < previousTarget {
+			c.recoveryTarget = max(c.recoveryTarget, previousTarget)
+		}
 		next = DelayStats{
 			Measurement:      c.delayStats.Measurement,
 			Estimate:         c.delayStats.Estimate,
@@ -137,6 +143,14 @@ func (c *rateController) onDelayStats(ds DelayStats) {
 }
 
 func (c *rateController) increase(now time.Time) int {
+	if c.recoveryTarget > c.target {
+		rate := min(c.multiplicativeIncrease(now), c.recoveryTarget)
+		if rate >= c.recoveryTarget {
+			c.recoveryTarget = 0
+		}
+
+		return rate
+	}
 	if c.latestDecreaseRate.average > 0 &&
 		float64(c.latestReceivedRate) > c.latestDecreaseRate.average-3*c.latestDecreaseRate.stdDeviation &&
 		float64(c.latestReceivedRate) < c.latestDecreaseRate.average+3*c.latestDecreaseRate.stdDeviation {
@@ -156,6 +170,10 @@ func (c *rateController) increase(now time.Time) int {
 
 		return rate
 	}
+	return c.multiplicativeIncrease(now)
+}
+
+func (c *rateController) multiplicativeIncrease(now time.Time) int {
 	eta := math.Pow(1.08, math.Min(float64(now.Sub(c.lastUpdate).Milliseconds())/1000, 1.0))
 	c.lastUpdate = now
 

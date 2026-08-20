@@ -37,7 +37,7 @@ func TestRateControllerRun(t *testing.T) {
 		},
 	}
 
-	t0 := time.Time{}
+	t0 := time.Now()
 	mockNoFn := func() time.Time {
 		t0 = t0.Add(100 * time.Millisecond)
 
@@ -87,4 +87,61 @@ func TestRateControllerIncreaseDoesNotReduceTarget(t *testing.T) {
 	controller.lastUpdate = now.Add(-100 * time.Millisecond)
 
 	assert.GreaterOrEqual(t, controller.increase(now), controller.target)
+}
+
+func TestRateControllerRecoversMultiplicativelyToPreDecreaseTarget(t *testing.T) {
+	now := time.Now()
+	controller := newRateController(func() time.Time { return now }, 8_000_000, 100_000, 50_000_000, func(DelayStats) {})
+	controller.target = 8_000_000
+	controller.latestReceivedRate = 2_400_000
+	controller.target = controller.decrease()
+	controller.recoveryTarget = 8_000_000
+	controller.latestDecreaseRate.average = float64(controller.target)
+	controller.latestDecreaseRate.stdDeviation = float64(controller.target)
+	now = now.Add(time.Second)
+
+	recovered := controller.increase(now)
+
+	assert.Equal(t, 2_203_200, recovered)
+	assert.Equal(t, 8_000_000, controller.recoveryTarget)
+}
+
+func TestRateControllerRecoveryStopsAtPreDecreaseTarget(t *testing.T) {
+	now := time.Now()
+	controller := newRateController(func() time.Time { return now }, 8_000_000, 100_000, 50_000_000, func(DelayStats) {})
+	controller.target = 7_900_000
+	controller.latestReceivedRate = 8_000_000
+	controller.lastUpdate = now.Add(-time.Second)
+	controller.recoveryTarget = 8_000_000
+
+	recovered := controller.increase(now)
+
+	assert.Equal(t, 8_000_000, recovered)
+	assert.Zero(t, controller.recoveryTarget)
+}
+
+func TestRateControllerTracksAndRecoversADecreasedTarget(t *testing.T) {
+	now := time.Now()
+	updates := []DelayStats{}
+	controller := newRateController(
+		func() time.Time { return now },
+		8_000_000,
+		100_000,
+		50_000_000,
+		func(stats DelayStats) { updates = append(updates, stats) },
+	)
+	controller.onReceivedRate(2_400_000)
+	controller.onDelayStats(DelayStats{Usage: usageNormal})
+	now = now.Add(time.Second)
+	controller.onDelayStats(DelayStats{Usage: usageOver})
+	assert.Equal(t, 2_040_000, controller.target)
+	assert.Equal(t, 8_000_000, controller.recoveryTarget)
+	now = now.Add(time.Second)
+	controller.onDelayStats(DelayStats{Usage: usageNormal})
+	now = now.Add(time.Second)
+	controller.onDelayStats(DelayStats{Usage: usageNormal})
+
+	assert.Len(t, updates, 2)
+	assert.Equal(t, 2_203_200, updates[1].TargetBitrate)
+	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 }
