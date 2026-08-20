@@ -112,6 +112,27 @@ func TestSendSideBWE_ErrorOnWriteRTCPAtClosedState(t *testing.T) {
 	require.Equal(t, bwe.isClosed(), true)
 }
 
+func TestSendSideBWEAppliesConfiguredBoundsToLossController(t *testing.T) {
+	const (
+		initialBitrate = 8_000_000
+		minimumBitrate = 2_000_000
+		maximumBitrate = 10_000_000
+	)
+	bwe, err := NewSendSideBWE(
+		SendSideBWEInitialBitrate(initialBitrate),
+		SendSideBWEMinBitrate(minimumBitrate),
+		SendSideBWEMaxBitrate(maximumBitrate),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, bwe.Close()) })
+	bwe.lossController.lock.Lock()
+	bwe.lossController.bitrate = 100_000
+	bwe.lossController.lock.Unlock()
+	bwe.onDelayUpdate(DelayStats{TargetBitrate: initialBitrate})
+	assert.Equal(t, minimumBitrate, bwe.GetTargetBitrate())
+	assert.Equal(t, minimumBitrate, bwe.GetStats()["lossTargetBitrate"])
+}
+
 func BenchmarkSendSideBWE_WriteRTCP(b *testing.B) {
 	numSequencesPerTwccReport := []int{10, 100, 500, 1000}
 
