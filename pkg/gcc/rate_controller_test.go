@@ -94,7 +94,7 @@ func TestRateControllerRecoversMultiplicativelyToPreDecreaseTarget(t *testing.T)
 	controller := newRateController(func() time.Time { return now }, 8_000_000, 100_000, 50_000_000, func(DelayStats) {})
 	controller.target = 8_000_000
 	controller.latestReceivedRate = 2_400_000
-	controller.target = controller.decrease()
+	controller.target = controller.decrease(now)
 	controller.recoveryTarget = 8_000_000
 	controller.latestDecreaseRate.average = float64(controller.target)
 	controller.latestDecreaseRate.stdDeviation = float64(controller.target)
@@ -102,7 +102,7 @@ func TestRateControllerRecoversMultiplicativelyToPreDecreaseTarget(t *testing.T)
 
 	recovered := controller.increase(now)
 
-	assert.Equal(t, 2_203_200, recovered)
+	assert.Equal(t, 7_344_000, recovered)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 }
 
@@ -134,7 +134,7 @@ func TestRateControllerTracksAndRecoversADecreasedTarget(t *testing.T) {
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
-	assert.Equal(t, 2_040_000, controller.target)
+	assert.Equal(t, 6_800_000, controller.target)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
@@ -142,6 +142,52 @@ func TestRateControllerTracksAndRecoversADecreasedTarget(t *testing.T) {
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
 
 	assert.Len(t, updates, 2)
-	assert.Equal(t, 2_203_200, updates[1].TargetBitrate)
+	assert.Equal(t, 7_344_000, updates[1].TargetBitrate)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
+}
+
+func TestRateControllerBoundsRepeatedCongestionResponse(t *testing.T) {
+	now := time.Now()
+	controller := newRateController(
+		func() time.Time { return now },
+		8_000_000,
+		100_000,
+		8_000_000,
+		func(DelayStats) {},
+	)
+	controller.onReceivedRate(4_000_000)
+	controller.onDelayStats(DelayStats{Usage: usageNormal})
+	for range 5 {
+		now = now.Add(minimumDecreaseInterval)
+		controller.onDelayStats(DelayStats{Usage: usageOver})
+	}
+
+	assert.Equal(t, 3_549_642, controller.target)
+	assert.Equal(t, 8_000_000, controller.recoveryTarget)
+}
+
+func TestRateControllerRecoverySurvivesTransientOveruse(t *testing.T) {
+	now := time.Now()
+	controller := newRateController(
+		func() time.Time { return now },
+		8_000_000,
+		100_000,
+		8_000_000,
+		func(DelayStats) {},
+	)
+	controller.onReceivedRate(2_400_000)
+	controller.onDelayStats(DelayStats{Usage: usageNormal})
+	now = now.Add(time.Second)
+	controller.onDelayStats(DelayStats{Usage: usageOver})
+	for second := 1; second <= 60; second++ {
+		now = now.Add(time.Second)
+		usage := usageNormal
+		if second%10 == 0 {
+			usage = usageOver
+		}
+		controller.onDelayStats(DelayStats{Usage: usage})
+	}
+
+	assert.GreaterOrEqual(t, controller.target, 6_400_000)
+	assert.LessOrEqual(t, controller.target, 8_000_000)
 }
