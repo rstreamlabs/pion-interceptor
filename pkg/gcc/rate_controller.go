@@ -10,9 +10,8 @@ import (
 )
 
 const (
-	decreaseEMAAlpha        = 0.95
-	beta                    = 0.85
-	minimumDecreaseInterval = 200 * time.Millisecond
+	decreaseEMAAlpha = 0.95
+	beta             = 0.85
 )
 
 type rateController struct {
@@ -32,7 +31,6 @@ type rateController struct {
 	latestRTT          time.Duration
 	latestReceivedRate int
 	latestDecreaseRate *exponentialMovingAverage
-	lastDecrease       time.Time
 	recoveryTarget     int
 }
 
@@ -124,9 +122,8 @@ func (c *rateController) onDelayStats(ds DelayStats) {
 
 	case stateDecrease:
 		previousTarget := c.target
-		if c.lastDecrease.IsZero() || now.Sub(c.lastDecrease) >= minimumDecreaseInterval {
-			c.target = clampInt(c.decrease(now), c.minBitrate, c.maxBitrate)
-			c.lastDecrease = now
+		if previousState != stateDecrease {
+			c.target = clampInt(c.decrease(now, c.recoveryTarget > c.target), c.minBitrate, c.maxBitrate)
 		}
 		if c.target < previousTarget {
 			c.recoveryTarget = max(c.recoveryTarget, previousTarget)
@@ -197,10 +194,12 @@ func (c *rateController) multiplicativeIncrease(now time.Time) int {
 	return rate
 }
 
-func (c *rateController) decrease(now time.Time) int {
-	receivedTarget := int(beta * float64(c.latestReceivedRate))
-	multiplicativeTarget := int(beta * float64(c.target))
-	target := min(c.target, max(receivedTarget, multiplicativeTarget))
+func (c *rateController) decrease(now time.Time, recovering bool) int {
+	target := int(beta * float64(c.latestReceivedRate))
+	if recovering {
+		target = max(target, int(beta*float64(c.target)))
+	}
+	target = min(c.target, target)
 	c.latestDecreaseRate.update(float64(c.latestReceivedRate))
 	c.lastUpdate = now
 
