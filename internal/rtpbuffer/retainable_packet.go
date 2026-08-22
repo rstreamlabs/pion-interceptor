@@ -20,6 +20,7 @@ type RetainablePacket struct {
 	buffer  *[]byte
 	payload []byte
 
+	retransmission bool
 	sequenceNumber uint16
 }
 

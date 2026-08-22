@@ -12,5 +12,7 @@ var (
 	errPacketReleased          = errors.New("could not retain packet, already released")
 	errFailedToCastHeaderPool  = errors.New("could not access header pool, failed cast")
 	errFailedToCastPayloadPool = errors.New("could not access payload pool, failed cast")
+	errNilPacket               = errors.New("could not prepare a nil packet")
 	errPaddingOverflow         = errors.New("padding size exceeds payload size")
+	errRTXSequencerRequired    = errors.New("could not prepare an RTX packet without a sequencer")
 )

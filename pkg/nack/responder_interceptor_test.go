@@ -97,6 +97,61 @@ func TestResponderInterceptor(t *testing.T) {
 	}
 }
 
+func TestResponderInterceptorAllocatesRTXSequenceWhenRepairIsSent(t *testing.T) {
+	factory, err := NewResponderInterceptor(ResponderSize(1))
+	require.NoError(t, err)
+	interceptorInstance, err := factory.NewInterceptor("")
+	require.NoError(t, err)
+	responder, ok := interceptorInstance.(*ResponderInterceptor)
+	require.True(t, ok)
+	info := &interceptor.StreamInfo{
+		PayloadType:               96,
+		PayloadTypeRetransmission: 97,
+		RTCPFeedback:              []interceptor.RTCPFeedback{{Type: "nack"}},
+		SSRC:                      1,
+		SSRCRetransmission:        2,
+	}
+	var repairs []*rtp.Packet
+	writer := responder.BindLocalStream(info, interceptor.RTPWriterFunc(func(
+		header *rtp.Header,
+		payload []byte,
+		_ interceptor.Attributes,
+	) (int, error) {
+		if header.SSRC == info.SSRCRetransmission {
+			repairs = append(repairs, &rtp.Packet{Header: *header, Payload: append([]byte(nil), payload...)})
+		}
+		return header.MarshalSize() + len(payload), nil
+	}))
+	writePrimary := func(sequence uint16) {
+		t.Helper()
+		_, err := writer.Write(&rtp.Header{
+			PayloadType:    info.PayloadType,
+			SequenceNumber: sequence,
+			SSRC:           info.SSRC,
+		}, []byte{42}, nil)
+		require.NoError(t, err)
+	}
+	requestRepair := func(sequence uint16) {
+		t.Helper()
+		responder.resendPackets(&rtcp.TransportLayerNack{
+			MediaSSRC: info.SSRC,
+			Nacks:     []rtcp.NackPair{{PacketID: sequence}},
+		})
+	}
+	writePrimary(0)
+	requestRepair(0)
+	for sequence := uint32(1); sequence <= uint32(rtpbuffer.Uint16SizeHalf); sequence++ {
+		writePrimary(uint16(sequence))
+	}
+	requestRepair(uint16(rtpbuffer.Uint16SizeHalf))
+	require.Len(t, repairs, 2)
+	require.Equal(t, uint16(1), repairs[1].SequenceNumber-repairs[0].SequenceNumber)
+	require.Equal(t, uint16(0), binary.BigEndian.Uint16(repairs[0].Payload[:2]))
+	require.Equal(t, uint16(rtpbuffer.Uint16SizeHalf), binary.BigEndian.Uint16(repairs[1].Payload[:2]))
+	responder.UnbindLocalStream(info)
+	require.NoError(t, responder.Close())
+}
+
 func TestResponderInterceptor_InvalidSize(t *testing.T) {
 	f, _ := NewResponderInterceptor(ResponderSize(5))
 

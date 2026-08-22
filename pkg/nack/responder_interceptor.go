@@ -66,6 +66,7 @@ type localStream struct {
 	rtpBuffer      *rtpbuffer.RTPBuffer
 	rtpBufferMutex sync.RWMutex
 	rtpWriter      interceptor.RTPWriter
+	rtxSequencer   rtp.Sequencer
 }
 
 // NewResponderInterceptor returns a new ResponderInterceptorFactor.
@@ -116,6 +117,9 @@ func (n *ResponderInterceptor) BindLocalStream(
 	stream := &localStream{
 		rtpBuffer: rtpBuffer,
 		rtpWriter: writer,
+	}
+	if info.SSRCRetransmission != 0 && info.PayloadTypeRetransmission != 0 {
+		stream.rtxSequencer = rtp.NewRandomSequencer()
 	}
 	n.streamsMu.Lock()
 	n.streams[info.SSRC] = stream
@@ -185,7 +189,15 @@ func (n *ResponderInterceptor) resendPackets(nack *rtcp.TransportLayerNack) {
 			// save the packet under the buffer lock
 			stream.rtpBufferMutex.Lock()
 			p := stream.rtpBuffer.Get(seq)
+			var err error
+			if p != nil {
+				p, err = n.packetFactory.PrepareRetransmission(p, stream.rtxSequencer)
+			}
 			stream.rtpBufferMutex.Unlock()
+			if err != nil {
+				n.log.Warnf("failed preparing nacked packet: %+v", err)
+				return true
+			}
 
 			if p != nil {
 				// send without holding rtpBufferMutex
