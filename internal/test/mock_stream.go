@@ -88,7 +88,10 @@ func NewMockStream(info *interceptor.StreamInfo, i interceptor.Interceptor) *Moc
 		info, interceptor.RTPWriterFunc(
 			func(header *rtp.Header, payload []byte, _ interceptor.Attributes) (int, error) {
 				select {
-				case mockStream.rtpOutModified <- &rtp.Packet{Header: *header, Payload: payload}:
+				case mockStream.rtpOutModified <- &rtp.Packet{
+					Header:  *header,
+					Payload: append([]byte(nil), payload...),
+				}:
 				default:
 				}
 
