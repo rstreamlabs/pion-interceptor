@@ -42,12 +42,17 @@ type lossBasedBandwidthEstimator struct {
 	log            logging.LeveledLogger
 }
 
-func newLossBasedBWE(initialBitrate int, loggerFactory logging.LoggerFactory) *lossBasedBandwidthEstimator {
+func newLossBasedBWE(
+	initialBitrate int,
+	minBitrate int,
+	maxBitrate int,
+	loggerFactory logging.LoggerFactory,
+) *lossBasedBandwidthEstimator {
 	return &lossBasedBandwidthEstimator{
 		lock:           sync.Mutex{},
-		maxBitrate:     100_000_000, // 100 mbit
-		minBitrate:     100_000,     // 100 kbit
-		bitrate:        initialBitrate,
+		maxBitrate:     maxBitrate,
+		minBitrate:     minBitrate,
+		bitrate:        clampInt(initialBitrate, minBitrate, maxBitrate),
 		averageLoss:    0,
 		lastLossUpdate: time.Time{},
 		lastIncrease:   time.Time{},
@@ -63,7 +68,7 @@ func (e *lossBasedBandwidthEstimator) getEstimate(wantedRate int) LossStats {
 	if e.bitrate <= 0 {
 		e.bitrate = clampInt(wantedRate, e.minBitrate, e.maxBitrate)
 	}
-	e.bitrate = min(wantedRate, e.bitrate)
+	e.bitrate = clampInt(min(wantedRate, e.bitrate), e.minBitrate, e.maxBitrate)
 
 	return LossStats{
 		TargetBitrate: e.bitrate,
