@@ -46,7 +46,7 @@ func TestArrivalGroup(t *testing.T) {
 			},
 		},
 		{
-			name: "setsTimesToLastACK",
+			name: "retainsFirstAndLatestSendTimes",
 			acks: []cc.Acknowledgment{{
 				SequenceNumber: 0,
 				Size:           0,
@@ -70,8 +70,9 @@ func TestArrivalGroup(t *testing.T) {
 					Departure:      time.Time{}.Add(time.Second),
 					Arrival:        time.Time{}.Add(time.Second),
 				}},
-				arrival:   time.Time{}.Add(time.Second),
-				departure: time.Time{},
+				arrival:         time.Time{}.Add(time.Second),
+				departure:       time.Time{},
+				latestDeparture: time.Time{}.Add(time.Second),
 			},
 		},
 		{
@@ -109,8 +110,9 @@ func TestArrivalGroup(t *testing.T) {
 					Departure:      time.Time{}.Add(50 * time.Millisecond),
 					Arrival:        time.Time{}.Add(56 * time.Millisecond),
 				}},
-				arrival:   time.Time{}.Add(56 * time.Millisecond),
-				departure: time.Time{}.Add(27 * time.Millisecond),
+				arrival:         time.Time{}.Add(56 * time.Millisecond),
+				departure:       time.Time{}.Add(27 * time.Millisecond),
+				latestDeparture: time.Time{}.Add(50 * time.Millisecond),
 			},
 		},
 	}

@@ -84,9 +84,7 @@ func interDepartureTimePkt(group arrivalGroup, ack cc.Acknowledgment) time.Durat
 }
 
 func interGroupDelayVariationPkt(group arrivalGroup, ack cc.Acknowledgment) time.Duration {
-	// Compare the same two packets for arrival and departure. Using the first
-	// departure but the last arrival makes even an expanding continuous flow
-	// look like one compressed burst, suppressing delay updates indefinitely.
-	lastDeparture := group.packets[len(group.packets)-1].Departure
-	return ack.Arrival.Sub(group.arrival) - ack.Departure.Sub(lastDeparture)
+	// Compare the completed arrival/send edges of the group. The maximum send
+	// time must not move backwards when packets are reordered within a group.
+	return ack.Arrival.Sub(group.arrival) - ack.Departure.Sub(group.latestDeparture)
 }

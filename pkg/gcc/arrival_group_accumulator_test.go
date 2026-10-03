@@ -12,6 +12,18 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestArrivalGroupDelayVariationPreservesLatestDeparture(t *testing.T) {
+	start := time.Unix(100, 0)
+	ack := func(sent, received time.Duration) cc.Acknowledgment {
+		return cc.Acknowledgment{Departure: start.Add(sent), Arrival: start.Add(received)}
+	}
+	group := newArrivalGroup(ack(0, 10*time.Millisecond))
+	group.add(ack(5*time.Millisecond, 15*time.Millisecond))
+	group.add(ack(4*time.Millisecond, 16*time.Millisecond))
+	assert.Equal(t, time.Duration(0), interGroupDelayVariationPkt(group, ack(6*time.Millisecond, 17*time.Millisecond)))
+	assert.Equal(t, 6*time.Millisecond, interDepartureTimePkt(group, ack(6*time.Millisecond, 17*time.Millisecond)))
+}
+
 func TestArrivalGroupAccumulatorObservesContinuousCongestion(t *testing.T) {
 	for _, arrivalInterval := range []time.Duration{time.Millisecond, 2 * time.Millisecond} {
 		t.Run(fmt.Sprintf("arrival=%s", arrivalInterval), func(t *testing.T) {
@@ -145,8 +157,9 @@ func TestArrivalGroupAccumulator(t *testing.T) {
 						Arrival:   time.Time{}.Add(20 * time.Millisecond),
 					},
 				},
-				arrival:   time.Time{}.Add(20 * time.Millisecond),
-				departure: time.Time{},
+				arrival:         time.Time{}.Add(20 * time.Millisecond),
+				departure:       time.Time{},
+				latestDeparture: time.Time{}.Add(3 * time.Millisecond),
 			}},
 		},
 		{
@@ -177,8 +190,9 @@ func TestArrivalGroupAccumulator(t *testing.T) {
 							Arrival:   time.Time{}.Add(20 * time.Millisecond),
 						},
 					},
-					arrival:   time.Time{}.Add(20 * time.Millisecond),
-					departure: time.Time{}.Add(0 * time.Millisecond),
+					arrival:         time.Time{}.Add(20 * time.Millisecond),
+					departure:       time.Time{}.Add(0 * time.Millisecond),
+					latestDeparture: time.Time{}.Add(3 * time.Millisecond),
 				},
 				{
 					packets: []cc.Acknowledgment{
@@ -187,8 +201,9 @@ func TestArrivalGroupAccumulator(t *testing.T) {
 							Arrival:   time.Time{}.Add(30 * time.Millisecond),
 						},
 					},
-					arrival:   time.Time{}.Add(30 * time.Millisecond),
-					departure: time.Time{}.Add(9 * time.Millisecond),
+					arrival:         time.Time{}.Add(30 * time.Millisecond),
+					departure:       time.Time{}.Add(9 * time.Millisecond),
+					latestDeparture: time.Time{}.Add(9 * time.Millisecond),
 				},
 			},
 		},
@@ -227,8 +242,9 @@ func TestArrivalGroupAccumulator(t *testing.T) {
 							Arrival:   time.Time{}.Add(34 * time.Millisecond),
 						},
 					},
-					arrival:   time.Time{}.Add(34 * time.Millisecond),
-					departure: time.Time{}.Add(6 * time.Millisecond),
+					arrival:         time.Time{}.Add(34 * time.Millisecond),
+					departure:       time.Time{}.Add(6 * time.Millisecond),
+					latestDeparture: time.Time{}.Add(6 * time.Millisecond),
 				},
 			},
 		},
@@ -271,8 +287,9 @@ func TestArrivalGroupAccumulator(t *testing.T) {
 							Arrival:        time.Time{}.Add(4 * time.Millisecond),
 						},
 					},
-					departure: time.Time{},
-					arrival:   time.Time{}.Add(4 * time.Millisecond),
+					departure:       time.Time{},
+					latestDeparture: time.Time{}.Add(3 * time.Millisecond),
+					arrival:         time.Time{}.Add(4 * time.Millisecond),
 				},
 				{
 					packets: []cc.Acknowledgment{
@@ -287,8 +304,9 @@ func TestArrivalGroupAccumulator(t *testing.T) {
 							Arrival:        time.Time{}.Add(10 * time.Millisecond),
 						},
 					},
-					departure: time.Time{}.Add(6 * time.Millisecond),
-					arrival:   time.Time{}.Add(10 * time.Millisecond),
+					departure:       time.Time{}.Add(6 * time.Millisecond),
+					latestDeparture: time.Time{}.Add(9 * time.Millisecond),
+					arrival:         time.Time{}.Add(10 * time.Millisecond),
 				},
 			},
 		},
