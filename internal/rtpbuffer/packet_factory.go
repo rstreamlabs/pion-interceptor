@@ -142,6 +142,7 @@ func (m *PacketFactoryCopy) PrepareRetransmission(
 	}
 	if sequencer == nil {
 		packet.Release()
+
 		return nil, errRTXSequencerRequired
 	}
 	clone, err := m.clonePacket(packet)
@@ -150,6 +151,7 @@ func (m *PacketFactoryCopy) PrepareRetransmission(
 		return nil, err
 	}
 	clone.header.SequenceNumber = sequencer.NextSequenceNumber()
+
 	return clone, nil
 }
 
@@ -172,12 +174,14 @@ func (m *PacketFactoryCopy) clonePacket(packet *RetainablePacket) (*RetainablePa
 	buffer, ok := m.payloadPool.Get().(*[]byte)
 	if !ok {
 		m.headerPool.Put(header)
+
 		return nil, errFailedToCastPayloadPool
 	}
 	payload := (*buffer)[:len(packet.payload)]
 	copy(payload, packet.payload)
 	clone.buffer = buffer
 	clone.payload = payload
+
 	return clone, nil
 }
 
@@ -213,6 +217,7 @@ func (f *PacketFactoryNoOp) PrepareRetransmission(
 	if packet == nil {
 		return nil, errNilPacket
 	}
+
 	return packet, nil
 }
 

@@ -53,12 +53,7 @@ func (a *arrivalGroupAccumulator) run(in <-chan []cc.Acknowledgment, agWriter fu
 					continue
 				}
 
-				// A Packet which has an inter-arrival time less than burst_time and
-				// an inter-group delay variation d(i) less than 0 is considered
-				// being part of the current group of packets.
-				if interArrivalTimePkt(group, next) <= a.interArrivalThreshold &&
-					interGroupDelayVariationPkt(group, next) < a.interGroupDelayVariationTreshold &&
-					next.Arrival.Sub(group.packets[0].Arrival) < a.maximumBurstDuration {
+				if a.belongsToCompressedBurst(group, next) {
 					group.add(next)
 
 					continue
@@ -69,6 +64,14 @@ func (a *arrivalGroupAccumulator) run(in <-chan []cc.Acknowledgment, agWriter fu
 			}
 		}
 	}
+}
+
+// A compressed arrival burst can extend a send group, but only for a bounded
+// interval so continuous traffic keeps producing delay measurements.
+func (a *arrivalGroupAccumulator) belongsToCompressedBurst(group arrivalGroup, next cc.Acknowledgment) bool {
+	return interArrivalTimePkt(group, next) <= a.interArrivalThreshold &&
+		interGroupDelayVariationPkt(group, next) < a.interGroupDelayVariationTreshold &&
+		next.Arrival.Sub(group.packets[0].Arrival) < a.maximumBurstDuration
 }
 
 func interArrivalTimePkt(group arrivalGroup, ack cc.Acknowledgment) time.Duration {

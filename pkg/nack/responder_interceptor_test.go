@@ -120,6 +120,7 @@ func TestResponderInterceptorAllocatesRTXSequenceWhenRepairIsSent(t *testing.T) 
 		if header.SSRC == info.SSRCRetransmission {
 			repairs = append(repairs, &rtp.Packet{Header: *header, Payload: append([]byte(nil), payload...)})
 		}
+
 		return header.MarshalSize() + len(payload), nil
 	}))
 	writePrimary := func(sequence uint16) {

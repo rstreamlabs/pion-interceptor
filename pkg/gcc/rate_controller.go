@@ -188,6 +188,7 @@ func (c *rateController) increase(now time.Time) int {
 
 		return rate
 	}
+
 	return c.multiplicativeIncrease(now)
 }
 
