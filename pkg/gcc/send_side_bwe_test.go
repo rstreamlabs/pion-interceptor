@@ -133,6 +133,46 @@ func TestSendSideBWEAppliesConfiguredBoundsToLossController(t *testing.T) {
 	assert.Equal(t, minimumBitrate, bwe.GetStats()["lossTargetBitrate"])
 }
 
+func TestSendSideBWELossRecoveryRequiresObservedThroughput(t *testing.T) {
+	bwe, err := NewSendSideBWE(
+		SendSideBWEInitialBitrate(8_000_000),
+		SendSideBWEMinBitrate(2_000_000),
+		SendSideBWEMaxBitrate(8_000_000),
+		SendSideBWEPacer(NewNoOpPacer()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, bwe.Close()) })
+
+	applyLossEstimate := func(target int) {
+		bwe.lossController.lock.Lock()
+		bwe.lossController.bitrate = target
+		bwe.lossController.lock.Unlock()
+		bwe.onDelayUpdate(DelayStats{TargetBitrate: 8_000_000})
+	}
+
+	// The independent delay estimate can stay high after a loss reduction.
+	// A source held at 2 Mbps must not ramp the effective estimate to 8 Mbps
+	// merely because its reports no longer contain packet loss.
+	bwe.delayController.onReceivedRate(2_000_000)
+	applyLossEstimate(2_000_000)
+	require.Equal(t, 2_000_000, bwe.GetTargetBitrate())
+	for _, target := range []int{2_500_000, 3_000_000, 4_000_000, 8_000_000} {
+		applyLossEstimate(target)
+		require.Equal(t, min(target, 3_000_000), bwe.GetTargetBitrate())
+	}
+
+	// More observed traffic permits recovery; a fresh reduction still applies
+	// immediately even when the received-rate bound would allow a higher rate.
+	bwe.delayController.onReceivedRate(3_000_000)
+	applyLossEstimate(8_000_000)
+	require.Equal(t, 4_500_000, bwe.GetTargetBitrate())
+	applyLossEstimate(2_500_000)
+	require.Equal(t, 2_500_000, bwe.GetTargetBitrate())
+	bwe.delayController.onReceivedRate(6_000_000)
+	applyLossEstimate(8_000_000)
+	require.Equal(t, 8_000_000, bwe.GetTargetBitrate())
+}
+
 func BenchmarkSendSideBWE_WriteRTCP(b *testing.B) {
 	numSequencesPerTwccReport := []int{10, 100, 500, 1000}
 

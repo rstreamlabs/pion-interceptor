@@ -79,6 +79,19 @@ func (c *rateController) onReceivedRate(rate int) {
 	c.latestReceivedRate = rate
 }
 
+// limitBitrateIncrease also bounds recovery of a loss-limited target. The
+// delay controller can retain a higher estimate while the source sends less;
+// that old estimate alone is not evidence for increasing the combined target.
+func (c *rateController) limitBitrateIncrease(previous, proposed int) int {
+	if proposed <= previous {
+		return proposed
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	return max(previous, min(proposed, int(1.5*float64(c.latestReceivedRate))))
+}
+
 func (c *rateController) updateRTT(rtt time.Duration) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
