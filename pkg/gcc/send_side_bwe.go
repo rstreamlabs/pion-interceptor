@@ -35,6 +35,14 @@ type Pacer interface {
 	Close() error
 }
 
+// RoundTripTimeObserver can optionally be implemented by a Pacer to receive
+// non-negative RTT observations from transport feedback. These observations can
+// include receiver feedback-batching delay. Implementations must be safe for
+// concurrent calls and return promptly; observation runs on the RTCP read path.
+type RoundTripTimeObserver interface {
+	ObserveRoundTripTime(time.Duration)
+}
+
 // Stats contains internal statistics of the bandwidth estimator.
 type Stats struct {
 	LossStats
@@ -232,8 +240,11 @@ func (e *SendSideBWE) WriteRTCP(pkts []rtcp.Packet, _ interceptor.Attributes) er
 			rtt := now.Sub(ack.Departure) - pendingTime
 			feedbackMinRTT = time.Duration(min(int(rtt), int(feedbackMinRTT)))
 		}
-		if feedbackMinRTT < math.MaxInt {
+		if feedbackMinRTT >= 0 && feedbackMinRTT < math.MaxInt {
 			e.delayController.updateRTT(feedbackMinRTT)
+			if observer, ok := e.pacer.(RoundTripTimeObserver); ok {
+				observer.ObserveRoundTripTime(feedbackMinRTT)
+			}
 		}
 
 		e.lossController.updateLossEstimate(acks)
