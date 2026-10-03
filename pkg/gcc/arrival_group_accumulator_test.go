@@ -4,12 +4,88 @@
 package gcc
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/pion/interceptor/internal/cc"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestArrivalGroupAccumulatorObservesContinuousCongestion(t *testing.T) {
+	for _, arrivalInterval := range []time.Duration{time.Millisecond, 2 * time.Millisecond} {
+		t.Run(fmt.Sprintf("arrival=%s", arrivalInterval), func(t *testing.T) {
+			start := time.Unix(100, 0)
+			acks := make([]cc.Acknowledgment, 600)
+			for i := range acks {
+				acks[i] = cc.Acknowledgment{
+					Departure: start.Add(time.Duration(i) * time.Millisecond),
+					Arrival:   start.Add(time.Second + time.Duration(i)*arrivalInterval),
+				}
+			}
+			input := make(chan []cc.Acknowledgment, 1)
+			input <- acks
+			close(input)
+			groups := 0
+			measurements := 0
+			slope := newSlopeEstimator(estimatorFunc(func(d time.Duration) time.Duration { return d }), func(ds DelayStats) {
+				measurements++
+				assert.Equal(t, 6*(arrivalInterval-time.Millisecond), ds.Measurement)
+			})
+			newArrivalGroupAccumulator().run(input, func(group arrivalGroup) {
+				groups++
+				assert.Len(t, group.packets, 6)
+				slope.onArrivalGroup(group)
+			})
+			assert.Equal(t, 99, groups)
+			assert.Equal(t, 98, measurements)
+		})
+	}
+}
+
+func TestArrivalGroupAccumulatorBoundsCompressedBursts(t *testing.T) {
+	start := time.Unix(100, 0)
+	acks := make([]cc.Acknowledgment, 600)
+	for i := range acks {
+		acks[i] = cc.Acknowledgment{
+			Departure: start.Add(time.Duration(i) * 2 * time.Millisecond),
+			Arrival:   start.Add(time.Second + time.Duration(i)*time.Millisecond),
+		}
+	}
+	input := make(chan []cc.Acknowledgment, 1)
+	input <- acks
+	close(input)
+	groups := 0
+	newArrivalGroupAccumulator().run(input, func(group arrivalGroup) {
+		groups++
+		assert.LessOrEqual(t, group.arrival.Sub(group.packets[0].Arrival), 100*time.Millisecond)
+	})
+	assert.GreaterOrEqual(t, groups, 5)
+}
+
+func TestArrivalGroupAccumulatorIgnoresUnreceivedPackets(t *testing.T) {
+	start := time.Unix(100, 0)
+	acked := make([]cc.Acknowledgment, 0, 30)
+	withLoss := []cc.Acknowledgment{{Departure: start.Add(-time.Millisecond)}}
+	for i := range 30 {
+		ack := cc.Acknowledgment{
+			Departure: start.Add(time.Duration(i) * time.Millisecond),
+			Arrival:   start.Add(time.Second + time.Duration(i)*time.Millisecond),
+		}
+		acked = append(acked, ack)
+		withLoss = append(withLoss, ack, cc.Acknowledgment{Departure: ack.Departure.Add(500 * time.Microsecond)})
+	}
+	collect := func(acks []cc.Acknowledgment) []arrivalGroup {
+		input := make(chan []cc.Acknowledgment, 1)
+		input <- acks
+		close(input)
+		var groups []arrivalGroup
+		newArrivalGroupAccumulator().run(input, func(group arrivalGroup) { groups = append(groups, group) })
+
+		return groups
+	}
+	assert.Equal(t, collect(acked), collect(withLoss))
+}
 
 func TestArrivalGroupAccumulator(t *testing.T) {
 	triggerNewGroupElement := cc.Acknowledgment{

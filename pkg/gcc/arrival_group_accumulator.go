@@ -13,6 +13,7 @@ type arrivalGroupAccumulator struct {
 	interDepartureThreshold          time.Duration
 	interArrivalThreshold            time.Duration
 	interGroupDelayVariationTreshold time.Duration
+	maximumBurstDuration             time.Duration
 }
 
 func newArrivalGroupAccumulator() *arrivalGroupAccumulator {
@@ -20,6 +21,7 @@ func newArrivalGroupAccumulator() *arrivalGroupAccumulator {
 		interDepartureThreshold:          5 * time.Millisecond,
 		interArrivalThreshold:            5 * time.Millisecond,
 		interGroupDelayVariationTreshold: 0,
+		maximumBurstDuration:             100 * time.Millisecond,
 	}
 }
 
@@ -28,6 +30,10 @@ func (a *arrivalGroupAccumulator) run(in <-chan []cc.Acknowledgment, agWriter fu
 	group := arrivalGroup{}
 	for acks := range in {
 		for _, next := range acks {
+			if next.Arrival.IsZero() {
+				// Missing packets carry no delay measurement.
+				continue
+			}
 			if !init {
 				group = newArrivalGroup(next)
 				init = true
@@ -51,7 +57,8 @@ func (a *arrivalGroupAccumulator) run(in <-chan []cc.Acknowledgment, agWriter fu
 				// an inter-group delay variation d(i) less than 0 is considered
 				// being part of the current group of packets.
 				if interArrivalTimePkt(group, next) <= a.interArrivalThreshold &&
-					interGroupDelayVariationPkt(group, next) < a.interGroupDelayVariationTreshold {
+					interGroupDelayVariationPkt(group, next) < a.interGroupDelayVariationTreshold &&
+					next.Arrival.Sub(group.packets[0].Arrival) < a.maximumBurstDuration {
 					group.add(next)
 
 					continue
@@ -77,5 +84,9 @@ func interDepartureTimePkt(group arrivalGroup, ack cc.Acknowledgment) time.Durat
 }
 
 func interGroupDelayVariationPkt(group arrivalGroup, ack cc.Acknowledgment) time.Duration {
-	return ack.Arrival.Sub(group.arrival) - ack.Departure.Sub(group.departure)
+	// Compare the same two packets for arrival and departure. Using the first
+	// departure but the last arrival makes even an expanding continuous flow
+	// look like one compressed burst, suppressing delay updates indefinitely.
+	lastDeparture := group.packets[len(group.packets)-1].Departure
+	return ack.Arrival.Sub(group.arrival) - ack.Departure.Sub(lastDeparture)
 }
