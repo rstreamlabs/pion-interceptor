@@ -186,15 +186,12 @@ func (c *rateController) multiplicativeIncrease(now time.Time) int {
 
 	// maximum increase to 1.5 * received rate
 	received := int(1.5 * float64(c.latestReceivedRate))
-	if rate > received && received > c.target {
-		return received
-	}
-
-	if rate < c.target {
-		return c.target
-	}
-
-	return rate
+	// A source can remain below the granted rate (for example while a loss
+	// hold is active). Clean feedback then proves only that lower throughput,
+	// not that capacity has recovered. Preserve the current estimate instead
+	// of increasing beyond the receive-rate bound or reducing it in increase
+	// state. This also applies to recovery toward a pre-congestion target.
+	return max(c.target, min(rate, received))
 }
 
 func (c *rateController) decrease(now time.Time) int {
