@@ -671,7 +671,8 @@ func TestFeedbackAdapterTWCC(t *testing.T) {
 		assert.NoError(t, err)
 
 		assert.NotEmpty(t, results)
-		assert.Len(t, results, 7)
+		// Only the two tracked packets are feedback; unknown padding is not loss.
+		assert.Len(t, results, 2)
 		assert.Contains(t, results, Acknowledgment{
 			SequenceNumber: 65535,
 			Size:           pkt65535.Header.MarshalSize() + 1200,

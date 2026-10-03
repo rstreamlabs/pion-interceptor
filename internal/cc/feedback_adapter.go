@@ -89,28 +89,30 @@ func (f *FeedbackAdapter) OnSent(ts time.Time, header *rtp.Header, size int, att
 func (f *FeedbackAdapter) unpackRunLengthChunk(
 	start uint16, refTime time.Time, chunk *rtcp.RunLengthChunk, deltas []*rtcp.RecvDelta,
 ) (consumedDeltas int, nextRef time.Time, acks []Acknowledgment, err error) {
-	result := make([]Acknowledgment, chunk.RunLength)
+	result := make([]Acknowledgment, 0, chunk.RunLength)
 	deltaIndex := 0
 
 	end := start + chunk.RunLength
-	resultIndex := 0
 	for i := start; i != end; i++ {
+		// Deltas describe the receiver's complete sequence, even when our
+		// bounded send history no longer contains an individual packet.
+		if chunk.PacketStatusSymbol != rtcp.TypeTCCPacketNotReceived {
+			if deltaIndex >= len(deltas) || deltas[deltaIndex] == nil {
+				return deltaIndex, refTime, result, errInvalidFeedback
+			}
+			refTime = refTime.Add(time.Duration(deltas[deltaIndex].Delta) * time.Microsecond)
+			deltaIndex++
+		}
 		key := feedbackHistoryKey{
 			ssrc:           0,
 			sequenceNumber: i,
 		}
 		if ack, ok := f.history.get(key); ok {
 			if chunk.PacketStatusSymbol != rtcp.TypeTCCPacketNotReceived {
-				if len(deltas)-1 < deltaIndex {
-					return deltaIndex, refTime, result, errInvalidFeedback
-				}
-				refTime = refTime.Add(time.Duration(deltas[deltaIndex].Delta) * time.Microsecond)
 				ack.Arrival = refTime
-				deltaIndex++
 			}
-			result[resultIndex] = ack
+			result = append(result, ack)
 		}
-		resultIndex++
 	}
 
 	return deltaIndex, refTime, result, nil
@@ -119,26 +121,26 @@ func (f *FeedbackAdapter) unpackRunLengthChunk(
 func (f *FeedbackAdapter) unpackStatusVectorChunk(
 	start uint16, refTime time.Time, chunk *rtcp.StatusVectorChunk, deltas []*rtcp.RecvDelta,
 ) (consumedDeltas int, nextRef time.Time, acks []Acknowledgment, err error) {
-	result := make([]Acknowledgment, len(chunk.SymbolList))
+	result := make([]Acknowledgment, 0, len(chunk.SymbolList))
 	deltaIndex := 0
-	resultIndex := 0
 	for i, symbol := range chunk.SymbolList {
+		if symbol != rtcp.TypeTCCPacketNotReceived {
+			if deltaIndex >= len(deltas) || deltas[deltaIndex] == nil {
+				return deltaIndex, refTime, result, errInvalidFeedback
+			}
+			refTime = refTime.Add(time.Duration(deltas[deltaIndex].Delta) * time.Microsecond)
+			deltaIndex++
+		}
 		key := feedbackHistoryKey{
 			ssrc:           0,
 			sequenceNumber: start + uint16(i), //nolint:gosec // G115
 		}
 		if ack, ok := f.history.get(key); ok {
 			if symbol != rtcp.TypeTCCPacketNotReceived {
-				if len(deltas)-1 < deltaIndex {
-					return deltaIndex, refTime, result, errInvalidFeedback
-				}
-				refTime = refTime.Add(time.Duration(deltas[deltaIndex].Delta) * time.Microsecond)
 				ack.Arrival = refTime
-				deltaIndex++
 			}
-			result[resultIndex] = ack
+			result = append(result, ack)
 		}
-		resultIndex++
 	}
 
 	return deltaIndex, refTime, result, nil
@@ -167,7 +169,7 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 			refTime = nextRefTime
 			result = append(result, acks...)
 			recvDeltas = recvDeltas[n:]
-			index = uint16(int(index) + len(acks)) //nolint:gosec // G115
+			index += chunk.RunLength
 		case *rtcp.StatusVectorChunk:
 			n, nextRefTime, acks, err := f.unpackStatusVectorChunk(index, refTime, chunk, recvDeltas)
 			if err != nil {
@@ -176,7 +178,7 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 			refTime = nextRefTime
 			result = append(result, acks...)
 			recvDeltas = recvDeltas[n:]
-			index = uint16(int(index) + len(acks)) //nolint:gosec // G115
+			index = uint16(int(index) + len(chunk.SymbolList)) //nolint:gosec // G115
 		default:
 			return nil, errInvalidFeedback
 		}
