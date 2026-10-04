@@ -272,14 +272,18 @@ func (e *SendSideBWE) GetTargetBitrate() int {
 func (e *SendSideBWE) GetStats() map[string]any {
 	e.lock.Lock()
 	defer e.lock.Unlock()
+	acknowledged, recovery, increaseMode := e.delayController.rateStats()
 
 	return map[string]any{
-		"lossTargetBitrate":    e.latestStats.LossStats.TargetBitrate,
-		"averageLoss":          e.latestStats.AverageLoss,
-		"lossLastObservedLoss": e.latestStats.LastObservedLoss,
-		"lossObservations":     e.latestStats.Observations,
-		"lossReductions":       e.latestStats.Reductions,
-		"lossRecoveries":       e.latestStats.Recoveries,
+		"acknowledgedBitrate":        acknowledged,
+		"delayRecoveryTargetBitrate": recovery,
+		"delayIncreaseMode":          increaseMode,
+		"lossTargetBitrate":          e.latestStats.LossStats.TargetBitrate,
+		"averageLoss":                e.latestStats.AverageLoss,
+		"lossLastObservedLoss":       e.latestStats.LastObservedLoss,
+		"lossObservations":           e.latestStats.Observations,
+		"lossReductions":             e.latestStats.Reductions,
+		"lossRecoveries":             e.latestStats.Recoveries,
 		"lossLimited": e.latestStats.AverageLoss > decreaseLossThreshold &&
 			e.latestStats.LossStats.TargetBitrate < e.latestStats.DelayStats.TargetBitrate,
 		"delayTargetBitrate": e.latestStats.DelayStats.TargetBitrate,

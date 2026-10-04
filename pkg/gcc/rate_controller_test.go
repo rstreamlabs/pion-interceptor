@@ -78,6 +78,25 @@ func TestRateControllerRun(t *testing.T) {
 	}
 }
 
+func TestRateControllerReportsAcknowledgedThroughputAndIncreaseMode(t *testing.T) {
+	controller := newRateController(time.Now, 2_000_000, 100_000, 8_000_000, func(DelayStats) {})
+	controller.onReceivedRate(1_500_000)
+	acknowledged, recovery, mode := controller.rateStats()
+	assert.Equal(t, 1_500_000, acknowledged)
+	assert.Zero(t, recovery)
+	assert.Equal(t, "multiplicative", mode)
+	controller.recoveryTarget = 6_000_000
+	_, recovery, mode = controller.rateStats()
+	assert.Equal(t, 6_000_000, recovery)
+	assert.Equal(t, "recovery", mode)
+	controller.recoveryTarget = 0
+	controller.latestDecreaseRate.average = 1_500_000
+	controller.latestDecreaseRate.stdDeviation = 100_000
+	_, _, mode = controller.rateStats()
+	assert.Equal(t, "additive", mode)
+	assert.Equal(t, 2_000_000, controller.target, "reading diagnostics cannot change the target")
+}
+
 func TestRateControllerIncreaseDoesNotReduceTarget(t *testing.T) {
 	now := time.Now()
 	controller := newRateController(time.Now, 8_000_000, 100_000, 50_000_000, func(DelayStats) {})

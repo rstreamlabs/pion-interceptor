@@ -79,6 +79,23 @@ func (c *rateController) onReceivedRate(rate int) {
 	c.latestReceivedRate = rate
 }
 
+// Snapshot diagnostics without introducing another controller or a logging
+// operation in the feedback path. Bitrates use the estimator's payload units.
+func (c *rateController) rateStats() (acknowledged, recovery int, increaseMode string) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	increaseMode = "multiplicative"
+	if c.recoveryTarget > c.target {
+		increaseMode = "recovery"
+	} else if c.latestDecreaseRate.average > 0 &&
+		float64(c.latestReceivedRate) > c.latestDecreaseRate.average-3*c.latestDecreaseRate.stdDeviation &&
+		float64(c.latestReceivedRate) < c.latestDecreaseRate.average+3*c.latestDecreaseRate.stdDeviation {
+		increaseMode = "additive"
+	}
+
+	return c.latestReceivedRate, c.recoveryTarget, increaseMode
+}
+
 // limitBitrateIncrease also bounds recovery of a loss-limited target. The
 // delay controller can retain a higher estimate while the source sends less;
 // that old estimate alone is not evidence for increasing the combined target.
