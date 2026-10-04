@@ -162,7 +162,7 @@ func TestRateControllerRecoversMultiplicativelyToPreDecreaseTarget(t *testing.T)
 
 	recovered := controller.increase(now)
 
-	assert.Equal(t, 7_344_000, recovered)
+	assert.Equal(t, 2_203_200, recovered)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 }
 
@@ -194,7 +194,7 @@ func TestRateControllerTracksAndRecoversADecreasedTarget(t *testing.T) {
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
-	assert.Equal(t, 6_800_000, controller.target)
+	assert.Equal(t, 2_040_000, controller.target)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 	controller.onReceivedRate(controller.target)
 	now = now.Add(time.Second)
@@ -203,7 +203,7 @@ func TestRateControllerTracksAndRecoversADecreasedTarget(t *testing.T) {
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
 
 	assert.Len(t, updates, 2)
-	assert.Equal(t, 7_344_000, updates[1].TargetBitrate)
+	assert.Equal(t, 2_203_200, updates[1].TargetBitrate)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 }
 
@@ -223,7 +223,7 @@ func TestRateControllerBoundsRepeatedCongestionResponse(t *testing.T) {
 		controller.onDelayStats(DelayStats{Usage: usageOver})
 	}
 
-	assert.Equal(t, 3_549_642, controller.target)
+	assert.Equal(t, 3_400_000, controller.target)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 }
 
@@ -241,6 +241,7 @@ func TestRateControllerRateLimitsSustainedCongestionResponse(t *testing.T) {
 	now = now.Add(minimumDecreaseInterval)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
 	first := controller.target
+	controller.onReceivedRate(2_000_000)
 	now = now.Add(minimumDecreaseInterval / 2)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
 
@@ -263,7 +264,7 @@ func TestRateControllerRespondsToSeparateCongestionEpisodes(t *testing.T) {
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
-	assert.Equal(t, 6_800_000, controller.target)
+	assert.Equal(t, 3_400_000, controller.target)
 	controller.onReceivedRate(controller.target)
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
@@ -273,7 +274,7 @@ func TestRateControllerRespondsToSeparateCongestionEpisodes(t *testing.T) {
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
 
-	assert.Equal(t, 6_242_400, controller.target)
+	assert.Equal(t, 1_700_000, controller.target)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 }
 

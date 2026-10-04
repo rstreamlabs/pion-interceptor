@@ -226,9 +226,10 @@ func (c *rateController) multiplicativeIncrease(now time.Time) int {
 }
 
 func (c *rateController) decrease(now time.Time) int {
-	receivedTarget := int(beta * float64(c.latestReceivedRate))
-	multiplicativeTarget := int(beta * float64(c.target))
-	target := min(c.target, max(receivedTarget, multiplicativeTarget))
+	// Back off below delivered throughput to drain self-induced delay, as in
+	// Pion's original AIMD rule. A floor derived from the old sending target
+	// would keep flooding a suddenly narrower link. Never increase on overuse.
+	target := min(c.target, int(beta*float64(c.latestReceivedRate)))
 	c.latestDecreaseRate.update(float64(c.latestReceivedRate))
 	c.lastUpdate = now
 
