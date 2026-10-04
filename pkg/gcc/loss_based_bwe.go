@@ -40,12 +40,6 @@ type LossStats struct {
 	Recoveries       uint64
 }
 
-type lossPacketKey struct {
-	ssrc      uint32
-	sequence  uint16
-	departure time.Time
-}
-
 type lossBasedBandwidthEstimator struct {
 	lock                 sync.Mutex
 	maxBitrate           int
@@ -64,7 +58,7 @@ type lossBasedBandwidthEstimator struct {
 	observationPackets   int
 	observationFirstSend time.Time
 	observationLastSend  time.Time
-	observationLost      map[lossPacketKey]struct{}
+	observationLost      int
 }
 
 func newLossBasedBWE(
@@ -114,10 +108,12 @@ func (e *lossBasedBandwidthEstimator) updateLossEstimate(results []cc.Acknowledg
 	defer e.lock.Unlock()
 	updated := false
 	for _, ack := range results {
-		key := lossPacketKey{ssrc: ack.SSRC, sequence: ack.SequenceNumber, departure: ack.Departure}
 		if ack.PreviouslyReportedLost {
 			if !ack.Arrival.IsZero() {
-				delete(e.observationLost, key)
+				// Signed interval accounting also credits receipts for a
+				// previously closed interval. The adapter emits this transition
+				// once; repeated feedback never grants additional credit.
+				e.observationLost--
 			}
 
 			continue
@@ -128,7 +124,7 @@ func (e *lossBasedBandwidthEstimator) updateLossEstimate(results []cc.Acknowledg
 			e.completeObservation()
 			updated = true
 		}
-		e.recordNewObservation(ack, key)
+		e.recordNewObservation(ack)
 	}
 	if e.observationPackets > 0 &&
 		e.observationLastSend.Sub(e.observationFirstSend) >= lossObservationDuration {
@@ -140,7 +136,7 @@ func (e *lossBasedBandwidthEstimator) updateLossEstimate(results []cc.Acknowledg
 }
 
 // recordNewObservation is called with e.lock held for a first report only.
-func (e *lossBasedBandwidthEstimator) recordNewObservation(ack cc.Acknowledgment, key lossPacketKey) {
+func (e *lossBasedBandwidthEstimator) recordNewObservation(ack cc.Acknowledgment) {
 	if e.observationPackets == 0 {
 		e.observationFirstSend = ack.Departure
 		e.observationLastSend = ack.Departure
@@ -153,18 +149,19 @@ func (e *lossBasedBandwidthEstimator) recordNewObservation(ack cc.Acknowledgment
 		e.observationLastSend = ack.Departure
 	}
 	if ack.Arrival.IsZero() {
-		if e.observationLost == nil {
-			e.observationLost = make(map[lossPacketKey]struct{})
-		}
-		e.observationLost[key] = struct{}{}
+		e.observationLost++
 	}
 }
 
-// completeObservation is called with e.lock held. A receipt after a completed
-// observation still informs delay/rate estimation, but cannot be counted again
-// as a new packet in a later loss observation.
+// completeObservation is called with e.lock held. Like the signed expected /
+// received interval accounting in RFC 3550 Appendix A.3, late receipts reduce
+// this interval's losses, even when first reported missing in an earlier one.
+// TWCC differs from RR accounting: the adapter deduplicates feedback and knows
+// actual sent packets; an old receipt does not increase the expected count.
+// Negative interval loss is reported as zero, with no credit carried forward.
+// https://www.rfc-editor.org/rfc/rfc3550.html#appendix-A.3
 func (e *lossBasedBandwidthEstimator) completeObservation() {
-	lossRatio := float64(len(e.observationLost)) / float64(e.observationPackets)
+	lossRatio := float64(max(0, e.observationLost)) / float64(e.observationPackets)
 	e.lastObservedLoss = lossRatio
 	e.observations++
 	previousBitrate := e.bitrate
@@ -172,7 +169,7 @@ func (e *lossBasedBandwidthEstimator) completeObservation() {
 	e.averageLoss = e.average(now.Sub(e.lastLossUpdate), e.averageLoss, lossRatio)
 	e.lastLossUpdate = now
 	e.observationPackets = 0
-	clear(e.observationLost)
+	e.observationLost = 0
 
 	increaseLoss := math.Max(e.averageLoss, lossRatio)
 	decreaseLoss := math.Min(e.averageLoss, lossRatio)

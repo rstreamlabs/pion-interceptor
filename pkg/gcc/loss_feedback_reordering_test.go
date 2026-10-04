@@ -101,7 +101,7 @@ func TestLossFeedbackDoesNotCountLateReceiptInNextObservation(t *testing.T) {
 	assert.InDelta(t, 1.0/300, estimator.averageLoss, 0.000001)
 	estimator.updateLossEstimate(lossFeedback(t, adapter, start, 0, 300, func(int) bool { return false }))
 	assert.Zero(t, estimator.observationPackets, "a receipt from a closed observation is not a new sent packet")
-	assert.Empty(t, estimator.observationLost)
+	assert.Equal(t, -1, estimator.observationLost, "a late receipt credits the signed loss count only")
 	estimator.updateLossEstimate(lossFeedback(t, adapter, start, 300, 100, func(int) bool { return false }))
 	assert.Equal(t, 100, estimator.observationPackets)
 }
@@ -112,7 +112,7 @@ func TestLossObservationHasHardMemoryBound(t *testing.T) {
 		estimator.updateLossEstimate([]cc.Acknowledgment{{SSRC: uint32(sequence / 65536), //nolint:gosec // G115
 			SequenceNumber: uint16(sequence % 65536), Departure: time.Unix(100, 0)}}) //nolint:gosec // G115
 		require.LessOrEqual(t, estimator.observationPackets, lossObservationCapacity)
-		require.LessOrEqual(t, len(estimator.observationLost), lossObservationCapacity)
+		require.LessOrEqual(t, estimator.observationLost, lossObservationCapacity)
 	}
 	assert.Equal(t, 1, estimator.observationPackets)
 	assert.Equal(t, 1.0, estimator.averageLoss)
@@ -176,4 +176,30 @@ func TestLossFeedbackRecoversFromResolvedLoss(t *testing.T) {
 	assert.LessOrEqual(t, stats.TargetBitrate, 8_000_000)
 	assert.Less(t, stats.AverageLoss, 0.02)
 	assert.False(t, estimator.updateLossEstimate(nil), "no feedback cannot authorize further recovery")
+}
+
+func TestLossFeedbackCreditsReceiptsAcrossObservationBoundaries(t *testing.T) {
+	adapter, start := lossFeedbackFlight(t, 1200)
+	estimator := newLossBasedBWE(8_000_000, 2_000_000, 10_000_000, logging.NewDefaultLoggerFactory())
+	now := start.Add(time.Second)
+	estimator.now = func() time.Time { return now }
+	// Thirty tail packets are first reported missing and arrive after this
+	// observation has already closed. A permanent loss is not inferred from
+	// the fact that receipt straddles an accounting interval.
+	estimator.updateLossEstimate(lossFeedback(t, adapter, start, 0, 300, func(s int) bool { return s >= 270 }))
+	assert.InDelta(t, .1, estimator.lastObservedLoss, .000001)
+	now = now.Add(300 * time.Millisecond)
+	estimator.updateLossEstimate(lossFeedback(t, adapter, start, 0, 300, func(int) bool { return false }))
+	estimator.updateLossEstimate(lossFeedback(t, adapter, start, 0, 300, func(int) bool { return false }))
+	assert.Equal(t, -30, estimator.observationLost, "duplicate feedback must not grant another credit")
+	estimator.updateLossEstimate(lossFeedback(t, adapter, start, 300, 300, func(s int) bool { return s >= 569 }))
+	// 31 new missing packets minus 30 late receipts, with 300 new packets.
+	assert.InDelta(t, 1.0/300, estimator.lastObservedLoss, .000001)
+	now = now.Add(300 * time.Millisecond)
+	estimator.updateLossEstimate(lossFeedback(t, adapter, start, 300, 300, func(int) bool { return false }))
+	estimator.updateLossEstimate(lossFeedback(t, adapter, start, 600, 300, func(int) bool { return false }))
+	assert.Zero(t, estimator.lastObservedLoss, "negative interval loss is clamped to zero")
+	now = now.Add(300 * time.Millisecond)
+	estimator.updateLossEstimate(lossFeedback(t, adapter, start, 900, 300, func(s int) bool { return s == 901 }))
+	assert.InDelta(t, 1.0/300, estimator.lastObservedLoss, .000001, "unused credit cannot mask future loss")
 }
