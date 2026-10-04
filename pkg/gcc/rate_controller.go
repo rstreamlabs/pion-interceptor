@@ -80,7 +80,7 @@ func (c *rateController) onReceivedRate(rate int) {
 }
 
 // Snapshot diagnostics without introducing another controller or a logging
-// operation in the feedback path. Bitrates use the estimator's payload units.
+// operation in the feedback path. Bitrates include the tracked RTP headers and payload.
 func (c *rateController) rateStats() (acknowledged, recovery int, increaseMode string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
