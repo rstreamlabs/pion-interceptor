@@ -19,6 +19,15 @@ import (
 // so we don't need to reparse.
 const TwccExtensionAttributesKey = iota
 
+// Keep delayed feedback observable without retaining received packets. The age
+// window follows the transport-feedback history used by libwebrtc; the count
+// limit also bounds memory during outages and stays within half the 16-bit
+// transport sequence space. These entries contain metadata, never media bytes.
+const (
+	feedbackHistoryWindow   = 60 * time.Second
+	feedbackHistoryCapacity = 1 << 15
+)
+
 var (
 	errMissingTWCCExtension = errors.New("missing transport layer cc header extension")
 	errInvalidFeedback      = errors.New("invalid feedback")
@@ -33,7 +42,7 @@ type FeedbackAdapter struct {
 
 // NewFeedbackAdapter returns a new FeedbackAdapter.
 func NewFeedbackAdapter() *FeedbackAdapter {
-	return &FeedbackAdapter{history: newFeedbackHistory(250)}
+	return &FeedbackAdapter{history: newFeedbackHistory(feedbackHistoryCapacity)}
 }
 
 func (f *FeedbackAdapter) onSentRFC8888(ts time.Time, header *rtp.Header, size int) error {
@@ -184,6 +193,14 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 		}
 	}
 
+	// Retire only after the complete feedback was parsed successfully. Missing
+	// packets stay available for a later received report after reordering.
+	for _, ack := range result {
+		if !ack.Arrival.IsZero() {
+			f.history.remove(feedbackHistoryKey{ssrc: ack.SSRC, sequenceNumber: ack.SequenceNumber})
+		}
+	}
+
 	return result, nil
 }
 
@@ -207,6 +224,7 @@ func (f *FeedbackAdapter) OnRFC8888Feedback(_ time.Time, feedback *rtcp.CCFeedba
 					delta := time.Duration((float64(mb.ArrivalTimeOffset) / 1024.0) * float64(time.Second))
 					ack.Arrival = referenceTime.Add(-delta)
 					ack.ECN = mb.ECN
+					f.history.remove(key)
 				}
 				result = append(result, ack)
 			}
@@ -247,6 +265,13 @@ func (f *feedbackHistory) get(key feedbackHistoryKey) (Acknowledgment, bool) {
 }
 
 func (f *feedbackHistory) add(ack Acknowledgment) {
+	for oldest := f.evictList.Back(); oldest != nil; oldest = f.evictList.Back() {
+		previous, ok := oldest.Value.(Acknowledgment)
+		if !ok || ack.Departure.Sub(previous.Departure) <= feedbackHistoryWindow {
+			break
+		}
+		f.removeOldest()
+	}
 	key := feedbackHistoryKey{
 		ssrc:           ack.SSRC,
 		sequenceNumber: ack.SequenceNumber,
@@ -264,6 +289,13 @@ func (f *feedbackHistory) add(ack Acknowledgment) {
 	// Evict if necessary
 	if f.evictList.Len() > f.size {
 		f.removeOldest()
+	}
+}
+
+func (f *feedbackHistory) remove(key feedbackHistoryKey) {
+	if entry, ok := f.items[key]; ok {
+		f.evictList.Remove(entry)
+		delete(f.items, key)
 	}
 }
 
