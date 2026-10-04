@@ -231,27 +231,33 @@ func (e *SendSideBWE) WriteRTCP(pkts []rtcp.Packet, _ interceptor.Attributes) er
 			continue
 		}
 
-		feedbackMinRTT := time.Duration(math.MaxInt)
-		for _, ack := range acks {
-			if ack.Arrival.IsZero() {
-				continue
-			}
-			pendingTime := feedbackSentTime.Sub(ack.Arrival)
-			rtt := now.Sub(ack.Departure) - pendingTime
-			feedbackMinRTT = time.Duration(min(int(rtt), int(feedbackMinRTT)))
-		}
-		if feedbackMinRTT >= 0 && feedbackMinRTT < math.MaxInt {
-			e.delayController.updateRTT(feedbackMinRTT)
-			if observer, ok := e.pacer.(RoundTripTimeObserver); ok {
-				observer.ObserveRoundTripTime(feedbackMinRTT)
-			}
-		}
+		e.observeFeedbackRTT(now, feedbackSentTime, acks)
 
-		e.lossController.updateLossEstimate(acks)
+		if e.lossController.updateLossEstimate(acks) {
+			e.onLossUpdate()
+		}
 		e.delayController.updateDelayEstimate(acks)
 	}
 
 	return nil
+}
+
+func (e *SendSideBWE) observeFeedbackRTT(now, feedbackSentTime time.Time, acks []cc.Acknowledgment) {
+	feedbackMinRTT := time.Duration(math.MaxInt)
+	for _, ack := range acks {
+		if ack.Arrival.IsZero() {
+			continue
+		}
+		pendingTime := feedbackSentTime.Sub(ack.Arrival)
+		rtt := now.Sub(ack.Departure) - pendingTime
+		feedbackMinRTT = time.Duration(min(int(rtt), int(feedbackMinRTT)))
+	}
+	if feedbackMinRTT >= 0 && feedbackMinRTT < math.MaxInt {
+		e.delayController.updateRTT(feedbackMinRTT)
+		if observer, ok := e.pacer.(RoundTripTimeObserver); ok {
+			observer.ObserveRoundTripTime(feedbackMinRTT)
+		}
+	}
 }
 
 // GetTargetBitrate returns the current target bitrate in bits per second.
@@ -268,8 +274,14 @@ func (e *SendSideBWE) GetStats() map[string]any {
 	defer e.lock.Unlock()
 
 	return map[string]any{
-		"lossTargetBitrate":  e.latestStats.LossStats.TargetBitrate,
-		"averageLoss":        e.latestStats.AverageLoss,
+		"lossTargetBitrate":    e.latestStats.LossStats.TargetBitrate,
+		"averageLoss":          e.latestStats.AverageLoss,
+		"lossLastObservedLoss": e.latestStats.LastObservedLoss,
+		"lossObservations":     e.latestStats.Observations,
+		"lossReductions":       e.latestStats.Reductions,
+		"lossRecoveries":       e.latestStats.Recoveries,
+		"lossLimited": e.latestStats.AverageLoss > decreaseLossThreshold &&
+			e.latestStats.LossStats.TargetBitrate < e.latestStats.DelayStats.TargetBitrate,
 		"delayTargetBitrate": e.latestStats.DelayStats.TargetBitrate,
 		"delayMeasurement":   float64(e.latestStats.Measurement.Microseconds()) / 1000.0,
 		"delayEstimate":      float64(e.latestStats.Estimate.Microseconds()) / 1000.0,
@@ -312,6 +324,22 @@ func (e *SendSideBWE) onDelayUpdate(delayStats DelayStats) {
 	e.lock.Lock()
 	defer e.lock.Unlock()
 
+	e.updateTargetLocked(delayStats)
+}
+
+// Loss-only feedback cannot produce an arrival group. Publish completed loss
+// observations independently instead of waiting indefinitely for a delay update.
+func (e *SendSideBWE) onLossUpdate() {
+	e.lock.Lock()
+	defer e.lock.Unlock()
+	delayStats := e.latestStats.DelayStats
+	if delayStats.TargetBitrate <= 0 {
+		delayStats.TargetBitrate = e.latestBitrate
+	}
+	e.updateTargetLocked(delayStats)
+}
+
+func (e *SendSideBWE) updateTargetLocked(delayStats DelayStats) {
 	lossStats := e.lossController.getEstimate(delayStats.TargetBitrate)
 	bitrateChanged := false
 	bitrate := min(delayStats.TargetBitrate, lossStats.TargetBitrate)

@@ -196,8 +196,11 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 	// Retire only after the complete feedback was parsed successfully. Missing
 	// packets stay available for a later received report after reordering.
 	for _, ack := range result {
+		key := feedbackHistoryKey{ssrc: ack.SSRC, sequenceNumber: ack.SequenceNumber}
 		if !ack.Arrival.IsZero() {
-			f.history.remove(feedbackHistoryKey{ssrc: ack.SSRC, sequenceNumber: ack.SequenceNumber})
+			f.history.remove(key)
+		} else {
+			f.history.markLost(key)
 		}
 	}
 
@@ -225,6 +228,8 @@ func (f *FeedbackAdapter) OnRFC8888Feedback(_ time.Time, feedback *rtcp.CCFeedba
 					ack.Arrival = referenceTime.Add(-delta)
 					ack.ECN = mb.ECN
 					f.history.remove(key)
+				} else {
+					f.history.markLost(key)
 				}
 				result = append(result, ack)
 			}
@@ -289,6 +294,16 @@ func (f *feedbackHistory) add(ack Acknowledgment) {
 	// Evict if necessary
 	if f.evictList.Len() > f.size {
 		f.removeOldest()
+	}
+}
+
+// markLost changes only feedback state, preserving the send-order expiry list.
+func (f *feedbackHistory) markLost(key feedbackHistoryKey) {
+	if entry, ok := f.items[key]; ok {
+		if ack, ok := entry.Value.(Acknowledgment); ok && !ack.PreviouslyReportedLost {
+			ack.PreviouslyReportedLost = true
+			entry.Value = ack
+		}
 	}
 }
 

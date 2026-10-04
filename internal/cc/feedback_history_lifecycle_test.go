@@ -195,3 +195,72 @@ func BenchmarkTransportFeedbackFlight(b *testing.B) {
 	}
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*64), "ns/packet")
 }
+
+func TestFeedbackTracksMissingReportsUntilLateReceipt(t *testing.T) {
+	for _, format := range []string{"twcc", "rfc8888"} {
+		t.Run(format, func(t *testing.T) {
+			adapter := NewFeedbackAdapter()
+			start := time.Unix(100, 0)
+			ssrc := uint32(0)
+			if format == "rfc8888" {
+				ssrc = 42
+			}
+			adapter.history.add(Acknowledgment{SSRC: ssrc, SequenceNumber: 1, Departure: start})
+			report := func(received bool) []Acknowledgment {
+				t.Helper()
+				if format == "rfc8888" {
+					return adapter.OnRFC8888Feedback(start.Add(time.Second), &rtcp.CCFeedbackReport{
+						ReportTimestamp: 65536,
+						ReportBlocks: []rtcp.CCFeedbackReportBlock{{
+							MediaSSRC: ssrc, BeginSequence: 1,
+							MetricBlocks: []rtcp.CCFeedbackMetricBlock{{Received: received}},
+						}},
+					})
+				}
+				symbol := rtcp.TypeTCCPacketNotReceived
+				var deltas []*rtcp.RecvDelta
+				if received {
+					symbol = rtcp.TypeTCCPacketReceivedSmallDelta
+					deltas = []*rtcp.RecvDelta{{Type: symbol, Delta: 1000}}
+				}
+				acks, err := adapter.OnTransportCCFeedback(start.Add(time.Second), &rtcp.TransportLayerCC{
+					BaseSequenceNumber: 1, PacketStatusCount: 1, ReferenceTime: 10,
+					PacketChunks: []rtcp.PacketStatusChunk{&rtcp.RunLengthChunk{
+						Type: rtcp.TypeTCCRunLengthChunk, PacketStatusSymbol: symbol, RunLength: 1,
+					}}, RecvDeltas: deltas,
+				})
+				require.NoError(t, err)
+
+				return acks
+			}
+			first := report(false)
+			require.Len(t, first, 1)
+			assert.False(t, first[0].PreviouslyReportedLost)
+			repeat := report(false)
+			require.Len(t, repeat, 1)
+			assert.True(t, repeat[0].PreviouslyReportedLost)
+			late := report(true)
+			require.Len(t, late, 1)
+			assert.True(t, late[0].PreviouslyReportedLost)
+			assert.False(t, late[0].Arrival.IsZero())
+			assert.Empty(t, report(true), "received duplicates must not re-enter estimation")
+		})
+	}
+}
+
+func TestMalformedFeedbackDoesNotMarkEarlierPacketsLost(t *testing.T) {
+	adapter := NewFeedbackAdapter()
+	for sequence := uint16(1); sequence <= 2; sequence++ {
+		adapter.history.add(Acknowledgment{SequenceNumber: sequence, Departure: time.Unix(100, 0)})
+	}
+	_, err := adapter.OnTransportCCFeedback(time.Unix(101, 0), &rtcp.TransportLayerCC{
+		BaseSequenceNumber: 1, PacketStatusCount: 2, ReferenceTime: 10,
+		PacketChunks: []rtcp.PacketStatusChunk{&rtcp.StatusVectorChunk{
+			Type: rtcp.TypeTCCStatusVectorChunk, SymbolSize: rtcp.TypeTCCSymbolSizeOneBit, SymbolList: []uint16{0, 1},
+		}},
+	})
+	require.Error(t, err)
+	ack, present := adapter.history.get(feedbackHistoryKey{sequenceNumber: 1})
+	require.True(t, present)
+	assert.False(t, ack.PreviouslyReportedLost)
+}

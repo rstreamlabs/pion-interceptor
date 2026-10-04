@@ -19,6 +19,9 @@ type Acknowledgment struct {
 	Departure      time.Time
 	Arrival        time.Time
 	ECN            rtcp.ECN
+	// PreviouslyReportedLost distinguishes repeated missing reports and late
+	// receipt from the first observation of a packet.
+	PreviouslyReportedLost bool
 }
 
 func (a Acknowledgment) String() string {
