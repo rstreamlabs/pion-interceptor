@@ -19,6 +19,15 @@ import (
 // so we don't need to reparse.
 const TwccExtensionAttributesKey = iota
 
+// Keep delayed feedback observable without retaining received packets. The age
+// window follows the transport-feedback history used by libwebrtc; the count
+// limit also bounds memory during outages and stays within half the 16-bit
+// transport sequence space. These entries contain metadata, never media bytes.
+const (
+	feedbackHistoryWindow   = 60 * time.Second
+	feedbackHistoryCapacity = 1 << 15
+)
+
 var (
 	errMissingTWCCExtension = errors.New("missing transport layer cc header extension")
 	errInvalidFeedback      = errors.New("invalid feedback")
@@ -33,7 +42,7 @@ type FeedbackAdapter struct {
 
 // NewFeedbackAdapter returns a new FeedbackAdapter.
 func NewFeedbackAdapter() *FeedbackAdapter {
-	return &FeedbackAdapter{history: newFeedbackHistory(250)}
+	return &FeedbackAdapter{history: newFeedbackHistory(feedbackHistoryCapacity)}
 }
 
 func (f *FeedbackAdapter) onSentRFC8888(ts time.Time, header *rtp.Header, size int) error {
@@ -89,28 +98,30 @@ func (f *FeedbackAdapter) OnSent(ts time.Time, header *rtp.Header, size int, att
 func (f *FeedbackAdapter) unpackRunLengthChunk(
 	start uint16, refTime time.Time, chunk *rtcp.RunLengthChunk, deltas []*rtcp.RecvDelta,
 ) (consumedDeltas int, nextRef time.Time, acks []Acknowledgment, err error) {
-	result := make([]Acknowledgment, chunk.RunLength)
+	result := make([]Acknowledgment, 0, chunk.RunLength)
 	deltaIndex := 0
 
 	end := start + chunk.RunLength
-	resultIndex := 0
 	for i := start; i != end; i++ {
+		// Deltas describe the receiver's complete sequence, even when our
+		// bounded send history no longer contains an individual packet.
+		if chunk.PacketStatusSymbol != rtcp.TypeTCCPacketNotReceived {
+			if deltaIndex >= len(deltas) || deltas[deltaIndex] == nil {
+				return deltaIndex, refTime, result, errInvalidFeedback
+			}
+			refTime = refTime.Add(time.Duration(deltas[deltaIndex].Delta) * time.Microsecond)
+			deltaIndex++
+		}
 		key := feedbackHistoryKey{
 			ssrc:           0,
 			sequenceNumber: i,
 		}
 		if ack, ok := f.history.get(key); ok {
 			if chunk.PacketStatusSymbol != rtcp.TypeTCCPacketNotReceived {
-				if len(deltas)-1 < deltaIndex {
-					return deltaIndex, refTime, result, errInvalidFeedback
-				}
-				refTime = refTime.Add(time.Duration(deltas[deltaIndex].Delta) * time.Microsecond)
 				ack.Arrival = refTime
-				deltaIndex++
 			}
-			result[resultIndex] = ack
+			result = append(result, ack)
 		}
-		resultIndex++
 	}
 
 	return deltaIndex, refTime, result, nil
@@ -119,26 +130,26 @@ func (f *FeedbackAdapter) unpackRunLengthChunk(
 func (f *FeedbackAdapter) unpackStatusVectorChunk(
 	start uint16, refTime time.Time, chunk *rtcp.StatusVectorChunk, deltas []*rtcp.RecvDelta,
 ) (consumedDeltas int, nextRef time.Time, acks []Acknowledgment, err error) {
-	result := make([]Acknowledgment, len(chunk.SymbolList))
+	result := make([]Acknowledgment, 0, len(chunk.SymbolList))
 	deltaIndex := 0
-	resultIndex := 0
 	for i, symbol := range chunk.SymbolList {
+		if symbol != rtcp.TypeTCCPacketNotReceived {
+			if deltaIndex >= len(deltas) || deltas[deltaIndex] == nil {
+				return deltaIndex, refTime, result, errInvalidFeedback
+			}
+			refTime = refTime.Add(time.Duration(deltas[deltaIndex].Delta) * time.Microsecond)
+			deltaIndex++
+		}
 		key := feedbackHistoryKey{
 			ssrc:           0,
 			sequenceNumber: start + uint16(i), //nolint:gosec // G115
 		}
 		if ack, ok := f.history.get(key); ok {
 			if symbol != rtcp.TypeTCCPacketNotReceived {
-				if len(deltas)-1 < deltaIndex {
-					return deltaIndex, refTime, result, errInvalidFeedback
-				}
-				refTime = refTime.Add(time.Duration(deltas[deltaIndex].Delta) * time.Microsecond)
 				ack.Arrival = refTime
-				deltaIndex++
 			}
-			result[resultIndex] = ack
+			result = append(result, ack)
 		}
-		resultIndex++
 	}
 
 	return deltaIndex, refTime, result, nil
@@ -167,7 +178,7 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 			refTime = nextRefTime
 			result = append(result, acks...)
 			recvDeltas = recvDeltas[n:]
-			index = uint16(int(index) + len(acks)) //nolint:gosec // G115
+			index += chunk.RunLength
 		case *rtcp.StatusVectorChunk:
 			n, nextRefTime, acks, err := f.unpackStatusVectorChunk(index, refTime, chunk, recvDeltas)
 			if err != nil {
@@ -176,9 +187,20 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 			refTime = nextRefTime
 			result = append(result, acks...)
 			recvDeltas = recvDeltas[n:]
-			index = uint16(int(index) + len(acks)) //nolint:gosec // G115
+			index = uint16(int(index) + len(chunk.SymbolList)) //nolint:gosec // G115
 		default:
 			return nil, errInvalidFeedback
+		}
+	}
+
+	// Retire only after the complete feedback was parsed successfully. Missing
+	// packets stay available for a later received report after reordering.
+	for _, ack := range result {
+		key := feedbackHistoryKey{ssrc: ack.SSRC, sequenceNumber: ack.SequenceNumber}
+		if !ack.Arrival.IsZero() {
+			f.history.remove(key)
+		} else {
+			f.history.markLost(key)
 		}
 	}
 
@@ -205,6 +227,9 @@ func (f *FeedbackAdapter) OnRFC8888Feedback(_ time.Time, feedback *rtcp.CCFeedba
 					delta := time.Duration((float64(mb.ArrivalTimeOffset) / 1024.0) * float64(time.Second))
 					ack.Arrival = referenceTime.Add(-delta)
 					ack.ECN = mb.ECN
+					f.history.remove(key)
+				} else {
+					f.history.markLost(key)
 				}
 				result = append(result, ack)
 			}
@@ -245,6 +270,13 @@ func (f *feedbackHistory) get(key feedbackHistoryKey) (Acknowledgment, bool) {
 }
 
 func (f *feedbackHistory) add(ack Acknowledgment) {
+	for oldest := f.evictList.Back(); oldest != nil; oldest = f.evictList.Back() {
+		previous, ok := oldest.Value.(Acknowledgment)
+		if !ok || ack.Departure.Sub(previous.Departure) <= feedbackHistoryWindow {
+			break
+		}
+		f.removeOldest()
+	}
 	key := feedbackHistoryKey{
 		ssrc:           ack.SSRC,
 		sequenceNumber: ack.SequenceNumber,
@@ -262,6 +294,23 @@ func (f *feedbackHistory) add(ack Acknowledgment) {
 	// Evict if necessary
 	if f.evictList.Len() > f.size {
 		f.removeOldest()
+	}
+}
+
+// markLost changes only feedback state, preserving the send-order expiry list.
+func (f *feedbackHistory) markLost(key feedbackHistoryKey) {
+	if entry, ok := f.items[key]; ok {
+		if ack, ok := entry.Value.(Acknowledgment); ok && !ack.PreviouslyReportedLost {
+			ack.PreviouslyReportedLost = true
+			entry.Value = ack
+		}
+	}
+}
+
+func (f *feedbackHistory) remove(key feedbackHistoryKey) {
+	if entry, ok := f.items[key]; ok {
+		f.evictList.Remove(entry)
+		delete(f.items, key)
 	}
 }
 

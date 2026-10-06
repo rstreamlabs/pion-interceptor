@@ -13,6 +13,7 @@ type arrivalGroupAccumulator struct {
 	interDepartureThreshold          time.Duration
 	interArrivalThreshold            time.Duration
 	interGroupDelayVariationTreshold time.Duration
+	maximumBurstDuration             time.Duration
 }
 
 func newArrivalGroupAccumulator() *arrivalGroupAccumulator {
@@ -20,6 +21,7 @@ func newArrivalGroupAccumulator() *arrivalGroupAccumulator {
 		interDepartureThreshold:          5 * time.Millisecond,
 		interArrivalThreshold:            5 * time.Millisecond,
 		interGroupDelayVariationTreshold: 0,
+		maximumBurstDuration:             100 * time.Millisecond,
 	}
 }
 
@@ -28,6 +30,10 @@ func (a *arrivalGroupAccumulator) run(in <-chan []cc.Acknowledgment, agWriter fu
 	group := arrivalGroup{}
 	for acks := range in {
 		for _, next := range acks {
+			if next.Arrival.IsZero() {
+				// Missing packets carry no delay measurement.
+				continue
+			}
 			if !init {
 				group = newArrivalGroup(next)
 				init = true
@@ -47,11 +53,7 @@ func (a *arrivalGroupAccumulator) run(in <-chan []cc.Acknowledgment, agWriter fu
 					continue
 				}
 
-				// A Packet which has an inter-arrival time less than burst_time and
-				// an inter-group delay variation d(i) less than 0 is considered
-				// being part of the current group of packets.
-				if interArrivalTimePkt(group, next) <= a.interArrivalThreshold &&
-					interGroupDelayVariationPkt(group, next) < a.interGroupDelayVariationTreshold {
+				if a.belongsToCompressedBurst(group, next) {
 					group.add(next)
 
 					continue
@@ -62,6 +64,14 @@ func (a *arrivalGroupAccumulator) run(in <-chan []cc.Acknowledgment, agWriter fu
 			}
 		}
 	}
+}
+
+// A compressed arrival burst can extend a send group, but only for a bounded
+// interval so continuous traffic keeps producing delay measurements.
+func (a *arrivalGroupAccumulator) belongsToCompressedBurst(group arrivalGroup, next cc.Acknowledgment) bool {
+	return interArrivalTimePkt(group, next) <= a.interArrivalThreshold &&
+		interGroupDelayVariationPkt(group, next) < a.interGroupDelayVariationTreshold &&
+		next.Arrival.Sub(group.packets[0].Arrival) < a.maximumBurstDuration
 }
 
 func interArrivalTimePkt(group arrivalGroup, ack cc.Acknowledgment) time.Duration {
@@ -77,5 +87,7 @@ func interDepartureTimePkt(group arrivalGroup, ack cc.Acknowledgment) time.Durat
 }
 
 func interGroupDelayVariationPkt(group arrivalGroup, ack cc.Acknowledgment) time.Duration {
-	return ack.Arrival.Sub(group.arrival) - ack.Departure.Sub(group.departure)
+	// Compare the completed arrival/send edges of the group. The maximum send
+	// time must not move backwards when packets are reordered within a group.
+	return ack.Arrival.Sub(group.arrival) - ack.Departure.Sub(group.latestDeparture)
 }

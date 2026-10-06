@@ -79,6 +79,36 @@ func (c *rateController) onReceivedRate(rate int) {
 	c.latestReceivedRate = rate
 }
 
+// Snapshot diagnostics without introducing another controller or a logging
+// operation in the feedback path. Bitrates include the tracked RTP headers and payload.
+func (c *rateController) rateStats() (acknowledged, recovery int, increaseMode string) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	increaseMode = "multiplicative"
+	if c.recoveryTarget > c.target {
+		increaseMode = "recovery"
+	} else if c.latestDecreaseRate.average > 0 &&
+		float64(c.latestReceivedRate) > c.latestDecreaseRate.average-3*c.latestDecreaseRate.stdDeviation &&
+		float64(c.latestReceivedRate) < c.latestDecreaseRate.average+3*c.latestDecreaseRate.stdDeviation {
+		increaseMode = "additive"
+	}
+
+	return c.latestReceivedRate, c.recoveryTarget, increaseMode
+}
+
+// limitBitrateIncrease also bounds recovery of a loss-limited target. The
+// delay controller can retain a higher estimate while the source sends less;
+// that old estimate alone is not evidence for increasing the combined target.
+func (c *rateController) limitBitrateIncrease(previous, proposed int) int {
+	if proposed <= previous {
+		return proposed
+	}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	return max(previous, min(proposed, int(1.5*float64(c.latestReceivedRate))))
+}
+
 func (c *rateController) updateRTT(rtt time.Duration) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -175,6 +205,7 @@ func (c *rateController) increase(now time.Time) int {
 
 		return rate
 	}
+
 	return c.multiplicativeIncrease(now)
 }
 
@@ -186,21 +217,19 @@ func (c *rateController) multiplicativeIncrease(now time.Time) int {
 
 	// maximum increase to 1.5 * received rate
 	received := int(1.5 * float64(c.latestReceivedRate))
-	if rate > received && received > c.target {
-		return received
-	}
-
-	if rate < c.target {
-		return c.target
-	}
-
-	return rate
+	// A source can remain below the granted rate (for example while a loss
+	// hold is active). Clean feedback then proves only that lower throughput,
+	// not that capacity has recovered. Preserve the current estimate instead
+	// of increasing beyond the receive-rate bound or reducing it in increase
+	// state. This also applies to recovery toward a pre-congestion target.
+	return max(c.target, min(rate, received))
 }
 
 func (c *rateController) decrease(now time.Time) int {
-	receivedTarget := int(beta * float64(c.latestReceivedRate))
-	multiplicativeTarget := int(beta * float64(c.target))
-	target := min(c.target, max(receivedTarget, multiplicativeTarget))
+	// Back off below delivered throughput to drain self-induced delay, as in
+	// Pion's original AIMD rule. A floor derived from the old sending target
+	// would keep flooding a suddenly narrower link. Never increase on overuse.
+	target := min(c.target, int(beta*float64(c.latestReceivedRate)))
 	c.latestDecreaseRate.update(float64(c.latestReceivedRate))
 	c.lastUpdate = now
 

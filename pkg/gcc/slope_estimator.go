@@ -53,5 +53,7 @@ func (e *slopeEstimator) onArrivalGroup(ag arrivalGroup) {
 }
 
 func interGroupDelayVariation(a, b arrivalGroup) time.Duration {
-	return b.arrival.Sub(a.arrival) - b.departure.Sub(a.departure)
+	// Both deltas describe completed groups. Comparing first send times with
+	// last arrival times mistakes variable send-burst lengths for queue growth.
+	return b.arrival.Sub(a.arrival) - b.latestDeparture.Sub(a.latestDeparture)
 }

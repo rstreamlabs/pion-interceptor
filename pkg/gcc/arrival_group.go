@@ -13,20 +13,27 @@ import (
 type arrivalGroup struct {
 	packets   []cc.Acknowledgment
 	departure time.Time
-	arrival   time.Time
+	// latestDeparture is the maximum send time, independent of arrival order.
+	// Group boundaries still use the first departure above.
+	latestDeparture time.Time
+	arrival         time.Time
 }
 
 func newArrivalGroup(a cc.Acknowledgment) arrivalGroup {
 	return arrivalGroup{
-		packets:   []cc.Acknowledgment{a},
-		departure: a.Departure,
-		arrival:   a.Arrival,
+		packets:         []cc.Acknowledgment{a},
+		departure:       a.Departure,
+		latestDeparture: a.Departure,
+		arrival:         a.Arrival,
 	}
 }
 
 func (g *arrivalGroup) add(a cc.Acknowledgment) {
 	g.packets = append(g.packets, a)
 	g.arrival = a.Arrival
+	if a.Departure.After(g.latestDeparture) {
+		g.latestDeparture = a.Departure
+	}
 }
 
 func (g arrivalGroup) String() string {

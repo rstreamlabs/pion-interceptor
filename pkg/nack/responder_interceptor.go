@@ -188,23 +188,24 @@ func (n *ResponderInterceptor) resendPackets(nack *rtcp.TransportLayerNack) {
 		nack.Nacks[i].Range(func(seq uint16) bool {
 			// save the packet under the buffer lock
 			stream.rtpBufferMutex.Lock()
-			p := stream.rtpBuffer.Get(seq)
+			packet := stream.rtpBuffer.Get(seq)
 			var err error
-			if p != nil {
-				p, err = n.packetFactory.PrepareRetransmission(p, stream.rtxSequencer)
+			if packet != nil {
+				packet, err = n.packetFactory.PrepareRetransmission(packet, stream.rtxSequencer)
 			}
 			stream.rtpBufferMutex.Unlock()
 			if err != nil {
 				n.log.Warnf("failed preparing nacked packet: %+v", err)
+
 				return true
 			}
 
-			if p != nil {
+			if packet != nil {
 				// send without holding rtpBufferMutex
-				if _, err := stream.rtpWriter.Write(p.Header(), p.Payload(), interceptor.Attributes{}); err != nil {
+				if _, err := stream.rtpWriter.Write(packet.Header(), packet.Payload(), interceptor.Attributes{}); err != nil {
 					n.log.Warnf("failed resending nacked packet: %+v", err)
 				}
-				p.Release()
+				packet.Release()
 			}
 
 			return true

@@ -4,6 +4,7 @@
 package gcc
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -77,6 +78,25 @@ func TestRateControllerRun(t *testing.T) {
 	}
 }
 
+func TestRateControllerReportsAcknowledgedThroughputAndIncreaseMode(t *testing.T) {
+	controller := newRateController(time.Now, 2_000_000, 100_000, 8_000_000, func(DelayStats) {})
+	controller.onReceivedRate(1_500_000)
+	acknowledged, recovery, mode := controller.rateStats()
+	assert.Equal(t, 1_500_000, acknowledged)
+	assert.Zero(t, recovery)
+	assert.Equal(t, "multiplicative", mode)
+	controller.recoveryTarget = 6_000_000
+	_, recovery, mode = controller.rateStats()
+	assert.Equal(t, 6_000_000, recovery)
+	assert.Equal(t, "recovery", mode)
+	controller.recoveryTarget = 0
+	controller.latestDecreaseRate.average = 1_500_000
+	controller.latestDecreaseRate.stdDeviation = 100_000
+	_, _, mode = controller.rateStats()
+	assert.Equal(t, "additive", mode)
+	assert.Equal(t, 2_000_000, controller.target, "reading diagnostics cannot change the target")
+}
+
 func TestRateControllerIncreaseDoesNotReduceTarget(t *testing.T) {
 	now := time.Now()
 	controller := newRateController(time.Now, 8_000_000, 100_000, 50_000_000, func(DelayStats) {})
@@ -89,6 +109,45 @@ func TestRateControllerIncreaseDoesNotReduceTarget(t *testing.T) {
 	assert.GreaterOrEqual(t, controller.increase(now), controller.target)
 }
 
+func TestRateControllerDoesNotIncreaseBeyondObservedThroughput(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		t.Run(fmt.Sprintf("recovery=%v", recovery), func(t *testing.T) {
+			now := time.Unix(100, 0)
+			controller := newRateController(func() time.Time { return now }, 4_000_000, 100_000, 8_000_000, func(DelayStats) {})
+			controller.onReceivedRate(2_000_000)
+			controller.onDelayStats(DelayStats{Usage: usageNormal})
+			controller.lastUpdate = now
+			if recovery {
+				controller.recoveryTarget = 8_000_000
+			}
+
+			// An encoder may stay below the estimate while a loss hold or a
+			// source quality limit is active. Clean feedback at that lower rate
+			// does not establish that the previous capacity has returned.
+			for range 60 {
+				now = now.Add(time.Second)
+				controller.onDelayStats(DelayStats{Usage: usageNormal})
+				assert.Equal(t, 4_000_000, controller.target)
+			}
+
+			// Preserve the estimate during application limitation, then allow
+			// growth again as soon as received traffic supports it.
+			controller.onReceivedRate(4_000_000)
+			now = now.Add(time.Second)
+			assert.Equal(t, 4_320_000, controller.increase(now))
+		})
+	}
+}
+
+func TestRateControllerIncreaseStopsAtThroughputHeadroom(t *testing.T) {
+	now := time.Unix(100, 0)
+	controller := newRateController(func() time.Time { return now }, 2_900_000, 100_000, 8_000_000, func(DelayStats) {})
+	controller.onReceivedRate(2_000_000)
+	controller.lastUpdate = now.Add(-time.Second)
+
+	assert.Equal(t, 3_000_000, controller.increase(now))
+}
+
 func TestRateControllerRecoversMultiplicativelyToPreDecreaseTarget(t *testing.T) {
 	now := time.Now()
 	controller := newRateController(func() time.Time { return now }, 8_000_000, 100_000, 50_000_000, func(DelayStats) {})
@@ -98,11 +157,12 @@ func TestRateControllerRecoversMultiplicativelyToPreDecreaseTarget(t *testing.T)
 	controller.recoveryTarget = 8_000_000
 	controller.latestDecreaseRate.average = float64(controller.target)
 	controller.latestDecreaseRate.stdDeviation = float64(controller.target)
+	controller.onReceivedRate(controller.target)
 	now = now.Add(time.Second)
 
 	recovered := controller.increase(now)
 
-	assert.Equal(t, 7_344_000, recovered)
+	assert.Equal(t, 2_203_200, recovered)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 }
 
@@ -134,15 +194,16 @@ func TestRateControllerTracksAndRecoversADecreasedTarget(t *testing.T) {
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
-	assert.Equal(t, 6_800_000, controller.target)
+	assert.Equal(t, 2_040_000, controller.target)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
+	controller.onReceivedRate(controller.target)
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
 
 	assert.Len(t, updates, 2)
-	assert.Equal(t, 7_344_000, updates[1].TargetBitrate)
+	assert.Equal(t, 2_203_200, updates[1].TargetBitrate)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 }
 
@@ -162,7 +223,7 @@ func TestRateControllerBoundsRepeatedCongestionResponse(t *testing.T) {
 		controller.onDelayStats(DelayStats{Usage: usageOver})
 	}
 
-	assert.Equal(t, 3_549_642, controller.target)
+	assert.Equal(t, 3_400_000, controller.target)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 }
 
@@ -180,6 +241,7 @@ func TestRateControllerRateLimitsSustainedCongestionResponse(t *testing.T) {
 	now = now.Add(minimumDecreaseInterval)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
 	first := controller.target
+	controller.onReceivedRate(2_000_000)
 	now = now.Add(minimumDecreaseInterval / 2)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
 
@@ -202,7 +264,8 @@ func TestRateControllerRespondsToSeparateCongestionEpisodes(t *testing.T) {
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
-	assert.Equal(t, 6_800_000, controller.target)
+	assert.Equal(t, 3_400_000, controller.target)
+	controller.onReceivedRate(controller.target)
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageNormal})
 	now = now.Add(time.Second)
@@ -211,7 +274,7 @@ func TestRateControllerRespondsToSeparateCongestionEpisodes(t *testing.T) {
 	now = now.Add(time.Second)
 	controller.onDelayStats(DelayStats{Usage: usageOver})
 
-	assert.Equal(t, 6_242_400, controller.target)
+	assert.Equal(t, 1_700_000, controller.target)
 	assert.Equal(t, 8_000_000, controller.recoveryTarget)
 }
 
