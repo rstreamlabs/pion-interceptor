@@ -21,7 +21,6 @@ func TestArrivalGroup(t *testing.T) {
 			name: "createsEmptyArrivalGroup",
 			acks: []cc.Acknowledgment{},
 			expected: arrivalGroup{
-				packets:   nil,
 				arrival:   time.Time{},
 				departure: time.Time{},
 			},
@@ -35,14 +34,9 @@ func TestArrivalGroup(t *testing.T) {
 				Arrival:        time.Time{},
 			}},
 			expected: arrivalGroup{
-				packets: []cc.Acknowledgment{{
-					SequenceNumber: 0,
-					Size:           0,
-					Departure:      time.Time{},
-					Arrival:        time.Time{},
-				}},
-				arrival:   time.Time{},
-				departure: time.Time{},
+				firstArrival: time.Time{},
+				arrival:      time.Time{},
+				departure:    time.Time{},
 			},
 		},
 		{
@@ -59,17 +53,7 @@ func TestArrivalGroup(t *testing.T) {
 				Arrival:        time.Time{}.Add(time.Second),
 			}},
 			expected: arrivalGroup{
-				packets: []cc.Acknowledgment{{
-					SequenceNumber: 0,
-					Size:           0,
-					Departure:      time.Time{},
-					Arrival:        time.Time{},
-				}, {
-					SequenceNumber: 0,
-					Size:           0,
-					Departure:      time.Time{}.Add(time.Second),
-					Arrival:        time.Time{}.Add(time.Second),
-				}},
+				firstArrival:    time.Time{},
 				arrival:         time.Time{}.Add(time.Second),
 				departure:       time.Time{},
 				latestDeparture: time.Time{}.Add(time.Second),
@@ -94,22 +78,7 @@ func TestArrivalGroup(t *testing.T) {
 				Arrival:        time.Time{}.Add(56 * time.Millisecond),
 			}},
 			expected: arrivalGroup{
-				packets: []cc.Acknowledgment{{
-					SequenceNumber: 0,
-					Size:           0,
-					Departure:      time.Time{}.Add(27 * time.Millisecond),
-					Arrival:        time.Time{},
-				}, {
-					SequenceNumber: 1,
-					Size:           1,
-					Departure:      time.Time{}.Add(32 * time.Millisecond),
-					Arrival:        time.Time{}.Add(37 * time.Millisecond),
-				}, {
-					SequenceNumber: 2,
-					Size:           2,
-					Departure:      time.Time{}.Add(50 * time.Millisecond),
-					Arrival:        time.Time{}.Add(56 * time.Millisecond),
-				}},
+				firstArrival:    time.Time{},
 				arrival:         time.Time{}.Add(56 * time.Millisecond),
 				departure:       time.Time{}.Add(27 * time.Millisecond),
 				latestDeparture: time.Time{}.Add(50 * time.Millisecond),

@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2026 The Pion community <https://pion.ly>
 // SPDX-License-Identifier: MIT
 
-// Package rfc8888 provides an interceptor that generates congestion control
+// Package ccfb provides an interceptor that generates congestion control
 // feedback reports as defined by RFC 8888.
-package rfc8888
+package ccfb
 
 import (
+	"errors"
 	"sync"
 	"time"
 
@@ -13,6 +14,8 @@ import (
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 )
+
+var errClosed = errors.New("interceptor is closed")
 
 // TickerFactory is a factory to create new tickers.
 type TickerFactory func(d time.Duration) ticker
@@ -49,7 +52,7 @@ func (s *SenderInterceptorFactory) NewInterceptor(_ string) (interceptor.Interce
 		senderInterceptor.loggerFactory = logging.NewDefaultLoggerFactory()
 	}
 	if senderInterceptor.log == nil {
-		senderInterceptor.log = senderInterceptor.loggerFactory.NewLogger("rfc8888_interceptor")
+		senderInterceptor.log = senderInterceptor.loggerFactory.NewLogger("ccfb_interceptor")
 	}
 
 	return senderInterceptor, nil
@@ -125,7 +128,11 @@ func (s *SenderInterceptor) BindRemoteStream(
 			sequenceNumber: header.SequenceNumber,
 			ecn:            0, // ECN is not supported (yet).
 		}
-		s.packetChan <- p
+		select {
+		case <-s.close:
+			return 0, nil, errClosed
+		case s.packetChan <- p:
+		}
 
 		return i, attr, nil
 	})
@@ -135,6 +142,8 @@ func (s *SenderInterceptor) BindRemoteStream(
 func (s *SenderInterceptor) Close() error {
 	s.log.Trace("close")
 	defer s.wg.Wait()
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	if !s.isClosed() {
 		close(s.close)
