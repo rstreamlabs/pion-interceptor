@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: 2026 rstream -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # Confirm the interceptor API baseline
 
 Pending before merging or releasing the updated fork.
