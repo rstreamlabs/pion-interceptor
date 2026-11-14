@@ -8,7 +8,7 @@ This fork reconciles the runtime changes in upstream v0.1.51, commit
 transport-feedback, throughput and sparse RTX extensions. Upstream comparison
 starts at `9a8ca49f93560d6f6590352e6c5abe2c1413fd81`. Consumers pin immutable fork
 commits; a pseudo-version's ancestor tag does not identify its reviewed source.
-The landing README and fork release/merge automation remain unchanged.
+Fork release and merge automation remain unchanged.
 
 ## Retained behavior
 
