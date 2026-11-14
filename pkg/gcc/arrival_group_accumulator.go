@@ -71,7 +71,7 @@ func (a *arrivalGroupAccumulator) run(in <-chan []cc.Acknowledgment, agWriter fu
 func (a *arrivalGroupAccumulator) belongsToCompressedBurst(group arrivalGroup, next cc.Acknowledgment) bool {
 	return interArrivalTimePkt(group, next) <= a.interArrivalThreshold &&
 		interGroupDelayVariationPkt(group, next) < a.interGroupDelayVariationTreshold &&
-		next.Arrival.Sub(group.packets[0].Arrival) < a.maximumBurstDuration
+		next.Arrival.Sub(group.firstArrival) < a.maximumBurstDuration
 }
 
 func interArrivalTimePkt(group arrivalGroup, ack cc.Acknowledgment) time.Duration {
@@ -79,10 +79,6 @@ func interArrivalTimePkt(group arrivalGroup, ack cc.Acknowledgment) time.Duratio
 }
 
 func interDepartureTimePkt(group arrivalGroup, ack cc.Acknowledgment) time.Duration {
-	if len(group.packets) == 0 {
-		return 0
-	}
-
 	return ack.Departure.Sub(group.departure)
 }
 

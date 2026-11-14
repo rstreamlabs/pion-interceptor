@@ -4,6 +4,7 @@
 package rtpfb
 
 import (
+	"slices"
 	"sync"
 	"time"
 
@@ -23,13 +24,14 @@ type ssrcSequenceNumber struct {
 // report. buildReport can be used to create a new report including all packets
 // from nextReport to highestAcked.
 type history struct {
-	lock               sync.RWMutex
+	lock               sync.Mutex
 	counter            uint64
 	twccToCounter      map[uint16]uint64
 	ssrcSeqNrToCounter map[ssrcSequenceNumber]uint64
 
 	packets      map[uint64]*PacketReport
 	highestAcked uint64
+	hasAcked     bool
 	nextReport   uint64
 
 	cleanUntil uint64
@@ -37,7 +39,6 @@ type history struct {
 
 func newHistory() *history {
 	return &history{
-		lock:               sync.RWMutex{},
 		counter:            0,
 		twccToCounter:      map[uint16]uint64{},
 		ssrcSeqNrToCounter: map[ssrcSequenceNumber]uint64{},
@@ -71,6 +72,7 @@ func (h *history) addOutgoing(
 		SSRC:               ssrc,
 		SequenceNumber:     h.counter,
 		RTPSequenceNumber:  rtpSequenceNumber,
+		IsTWCC:             isTWCC,
 		TWCCSequenceNumber: twccSequenceNumber,
 		Size:               size,
 		Departure:          departure,
@@ -84,29 +86,33 @@ func (h *history) addOutgoing(
 // onFeedback maps an incoming ack for counter to the PacketReport stored when
 // the packet was sent. If the packet cannot be found, the ack is ignored.
 //
-// onFeedback must be called while holding the lock for reading.
+// onFeedback must be called while holding the lock for writing.
 // onFeedback returns the time between ts and the time the packet was sent.
 func (h *history) onFeedback(ts time.Time, counter uint64, ack acknowledgement) (time.Duration, bool) {
-	p, ok := h.packets[counter]
+	report, ok := h.packets[counter]
 	if !ok {
 		// ignore ack for unknown packet
 		return 0, false
 	}
-	p.Arrived = ack.arrived
-	if p.Arrived && h.highestAcked < p.SequenceNumber {
-		h.highestAcked = p.SequenceNumber
+	if !ack.arrived && report.Arrived {
+		return ts.Sub(report.Departure), true
 	}
-	p.Arrival = ack.arrival
-	p.ECN = ack.ecn
+	report.Arrived = ack.arrived
+	if report.Arrived {
+		h.highestAcked = max(h.highestAcked, report.SequenceNumber)
+		h.hasAcked = true
+	}
+	report.Arrival = ack.arrival
+	report.ECN = ack.ecn
 
-	return ts.Sub(p.Departure), true
+	return ts.Sub(report.Departure), true
 }
 
 // onTWCCFeedback maps an acknowledgement to the counter by TWCC sequence number
 // and then calls onFeedback.
 func (h *history) onTWCCFeedback(ts time.Time, ack acknowledgement) (time.Duration, bool) {
-	h.lock.RLock()
-	defer h.lock.RUnlock()
+	h.lock.Lock()
+	defer h.lock.Unlock()
 
 	counter, ok := h.twccToCounter[ack.sequenceNumber]
 	if !ok {
@@ -117,11 +123,33 @@ func (h *history) onTWCCFeedback(ts time.Time, ack acknowledgement) (time.Durati
 	return h.onFeedback(ts, counter, ack)
 }
 
+func (h *history) twccInRange(start, count uint16) []uint16 {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	var result []uint16
+	if int(count) <= len(h.twccToCounter) {
+		for offset := range count {
+			if _, ok := h.twccToCounter[start+offset]; ok {
+				result = append(result, start+offset)
+			}
+		}
+	} else {
+		for sequenceNumber := range h.twccToCounter {
+			if sequenceNumber-start < count {
+				result = append(result, sequenceNumber)
+			}
+		}
+		slices.SortFunc(result, func(a, b uint16) int { return int(a-start) - int(b-start) })
+	}
+
+	return result
+}
+
 // onCCFBFeedback maps an acknowledgement to the counter by ssrc and sequence
 // number and then calls onFeedback.
 func (h *history) onCCFBFeedback(ts time.Time, ssrc uint32, ack acknowledgement) (time.Duration, bool) {
-	h.lock.RLock()
-	defer h.lock.RUnlock()
+	h.lock.Lock()
+	defer h.lock.Unlock()
 
 	counter, ok := h.ssrcSeqNrToCounter[ssrcSequenceNumber{
 		ssrc:           ssrc,
@@ -147,7 +175,8 @@ func (h *history) buildReport() []PacketReport {
 	h.lock.Lock()
 	defer h.lock.Unlock()
 
-	if h.nextReport > h.highestAcked {
+	// The initial highestAcked value of zero is not an acknowledgement.
+	if !h.hasAcked || h.nextReport > h.highestAcked {
 		return nil
 	}
 	res := make([]PacketReport, 0, h.highestAcked-h.nextReport+1)
@@ -187,7 +216,8 @@ func (h *history) cleanBefore(counter uint64) {
 	for i := h.cleanUntil; i < counter; i++ {
 		if p, ok := h.packets[i]; ok {
 			h.delete(p)
+			delete(h.packets, i)
 		}
 	}
-	h.cleanUntil = counter - 1
+	h.cleanUntil = counter
 }
