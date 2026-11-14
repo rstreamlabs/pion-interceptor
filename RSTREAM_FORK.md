@@ -47,6 +47,14 @@ this lifecycle alongside the non-RTX case, concurrent repeated NACKs, pacing,
 retry and close. The sparse RTX sequence regression remains unchanged except for
 the upstream private method's additional bitrate argument.
 
+## API baseline
+
+The fork follows upstream 0.1.51, including the move from `pkg/rfc8888` to
+`pkg/ccfb` and the TWCC sender's loss of value comparability. Existing callers
+must use the current package/options and sender pointers. The API comparison
+against the fork's older main branch remains an explicit review gate; passing
+rstream consumer tests does not establish compatibility for every old caller.
+
 ## Qualification
 
 Run the full race suite and vet, plus repeated pending-RTX tests:
