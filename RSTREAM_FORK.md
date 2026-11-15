@@ -71,3 +71,16 @@ loss/recovery, observed-throughput and allocation tests. Producer/distributor
 decoded-media and ICE-restart qualification with the exact WebRTC/interceptor
 pins is required before accepting consumer updates. Passing this library suite
 alone does not certify those applications or production capacity.
+
+## Build this checkout
+
+Use the Go version declared in `go.mod` or a compatible newer toolchain. From the
+repository root, `go build ./...` compiles the library packages and included
+commands without application credentials. Locked modules must be available in
+the Go cache or downloaded first. Keep the upstream module path: consumers select
+this fork through their reviewed module replacement and immutable revision, not
+by renaming imports or installing an upstream `latest` release.
+
+This build is a local first check. The qualification requirements above still
+apply; it does not certify consuming video applications or replace their pinned
+dependency graph. Upstream usage and attribution remain in `README.md`.
