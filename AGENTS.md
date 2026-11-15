@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: 2026 rstream -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # Repository guidance
 
 ## Shared conventions
