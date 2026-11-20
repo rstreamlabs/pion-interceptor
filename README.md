@@ -1,4 +1,4 @@
-This fork retains RTP/RTCP repair and feedback behavior needed by rstream’s video applications while those changes are not available in an upstream release. The [fork notes](RSTREAM_FORK.md) identify the retained changes and the API compatibility gate. The upstream project README follows.
+This fork preserves FlexFEC repair and the RTP/RTCP feedback behavior used by rstream video applications.
 
 ---
 
