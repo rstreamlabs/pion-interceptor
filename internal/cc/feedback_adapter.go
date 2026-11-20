@@ -6,6 +6,7 @@ package cc
 import (
 	"container/list"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -18,6 +19,9 @@ import (
 // TwccExtensionAttributesKey identifies the TWCC value in the attribute collection
 // so we don't need to reparse.
 const TwccExtensionAttributesKey = iota
+
+// TargetBitrateKey identifies a func() int returning the current target bitrate in bits per second.
+type TargetBitrateKey struct{}
 
 // Keep delayed feedback observable without retaining received packets. The age
 // window follows the transport-feedback history used by libwebrtc; the count
@@ -36,8 +40,10 @@ var (
 // FeedbackAdapter converts incoming RTCP Packets (TWCC and RFC8888) into Acknowledgments.
 // Acknowledgments are the common format that Congestion Controllers in Pion understand.
 type FeedbackAdapter struct {
-	lock    sync.Mutex
-	history *feedbackHistory
+	lock                     sync.Mutex
+	history                  *feedbackHistory
+	referenceTime            int64
+	referenceTimeInitialized bool
 }
 
 // NewFeedbackAdapter returns a new FeedbackAdapter.
@@ -95,64 +101,74 @@ func (f *FeedbackAdapter) OnSent(ts time.Time, header *rtp.Header, size int, att
 	return f.onSentRFC8888(ts, header, size)
 }
 
+// unpackRunLengthChunk reads at most maxStatuses packet statuses from the
+// chunk: the feedback's PacketStatusCount bounds every chunk.
 func (f *FeedbackAdapter) unpackRunLengthChunk(
-	start uint16, refTime time.Time, chunk *rtcp.RunLengthChunk, deltas []*rtcp.RecvDelta,
-) (consumedDeltas int, nextRef time.Time, acks []Acknowledgment, err error) {
-	result := make([]Acknowledgment, 0, chunk.RunLength)
+	start uint16, refTime time.Time, chunk *rtcp.RunLengthChunk, deltas []*rtcp.RecvDelta, maxStatuses uint16,
+) (consumedDeltas int, nextRef time.Time, statusCount uint16, acks []Acknowledgment, err error) {
+	count := min(chunk.RunLength, maxStatuses)
 	deltaIndex := 0
+	acks = []Acknowledgment{}
+	if (chunk.PacketStatusSymbol == rtcp.TypeTCCPacketNotReceived ||
+		chunk.PacketStatusSymbol == rtcp.TypeTCCPacketReceivedWithoutDelta) && int(count) > len(f.history.items) {
+		return 0, refTime, count, f.history.twccInRange(start, count), nil
+	}
 
-	end := start + chunk.RunLength
-	for i := start; i != end; i++ {
-		// Deltas describe the receiver's complete sequence, even when our
-		// bounded send history no longer contains an individual packet.
-		if chunk.PacketStatusSymbol != rtcp.TypeTCCPacketNotReceived {
+	end := start + count
+	for sequenceNumber := start; sequenceNumber != end; sequenceNumber++ {
+		var arrival time.Time
+		if chunk.PacketStatusSymbol == rtcp.TypeTCCPacketReceivedSmallDelta ||
+			chunk.PacketStatusSymbol == rtcp.TypeTCCPacketReceivedLargeDelta {
 			if deltaIndex >= len(deltas) || deltas[deltaIndex] == nil {
-				return deltaIndex, refTime, result, errInvalidFeedback
+				return deltaIndex, refTime, count, acks, errInvalidFeedback
 			}
 			refTime = refTime.Add(time.Duration(deltas[deltaIndex].Delta) * time.Microsecond)
+			arrival = refTime
 			deltaIndex++
 		}
+
 		key := feedbackHistoryKey{
 			ssrc:           0,
-			sequenceNumber: i,
+			sequenceNumber: sequenceNumber,
 		}
 		if ack, ok := f.history.get(key); ok {
-			if chunk.PacketStatusSymbol != rtcp.TypeTCCPacketNotReceived {
-				ack.Arrival = refTime
-			}
-			result = append(result, ack)
+			ack.Arrival = arrival
+			acks = append(acks, ack)
 		}
 	}
 
-	return deltaIndex, refTime, result, nil
+	return deltaIndex, refTime, count, acks, nil
 }
 
+// unpackStatusVectorChunk reads at most maxStatuses symbols from the chunk.
 func (f *FeedbackAdapter) unpackStatusVectorChunk(
-	start uint16, refTime time.Time, chunk *rtcp.StatusVectorChunk, deltas []*rtcp.RecvDelta,
-) (consumedDeltas int, nextRef time.Time, acks []Acknowledgment, err error) {
-	result := make([]Acknowledgment, 0, len(chunk.SymbolList))
+	start uint16, refTime time.Time, chunk *rtcp.StatusVectorChunk, deltas []*rtcp.RecvDelta, maxStatuses uint16,
+) (consumedDeltas int, nextRef time.Time, statusCount uint16, acks []Acknowledgment, err error) {
+	symbols := chunk.SymbolList[:min(len(chunk.SymbolList), int(maxStatuses))]
 	deltaIndex := 0
-	for i, symbol := range chunk.SymbolList {
-		if symbol != rtcp.TypeTCCPacketNotReceived {
+	acks = []Acknowledgment{}
+	for i, symbol := range symbols {
+		var arrival time.Time
+		if symbol == rtcp.TypeTCCPacketReceivedSmallDelta || symbol == rtcp.TypeTCCPacketReceivedLargeDelta {
 			if deltaIndex >= len(deltas) || deltas[deltaIndex] == nil {
-				return deltaIndex, refTime, result, errInvalidFeedback
+				return deltaIndex, refTime, uint16(len(symbols)), acks, errInvalidFeedback //nolint:gosec // G115
 			}
 			refTime = refTime.Add(time.Duration(deltas[deltaIndex].Delta) * time.Microsecond)
+			arrival = refTime
 			deltaIndex++
 		}
+
 		key := feedbackHistoryKey{
 			ssrc:           0,
 			sequenceNumber: start + uint16(i), //nolint:gosec // G115
 		}
 		if ack, ok := f.history.get(key); ok {
-			if symbol != rtcp.TypeTCCPacketNotReceived {
-				ack.Arrival = refTime
-			}
-			result = append(result, ack)
+			ack.Arrival = arrival
+			acks = append(acks, ack)
 		}
 	}
 
-	return deltaIndex, refTime, result, nil
+	return deltaIndex, refTime, uint16(len(symbols)), acks, nil //nolint:gosec // G115
 }
 
 // OnTransportCCFeedback converts incoming TWCC RTCP packet feedback to
@@ -165,36 +181,49 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 
 	result := []Acknowledgment{}
 	index := feedback.BaseSequenceNumber
-	refTime := time.Time{}.Add(time.Duration(feedback.ReferenceTime) * 64 * time.Millisecond)
+	referenceTime := int64(feedback.ReferenceTime & 0xffffff)
+	if f.referenceTimeInitialized {
+		// Choose the nearest epoch.
+		delta := (referenceTime-f.referenceTime+(1<<23))&0xffffff - (1 << 23)
+		referenceTime = f.referenceTime + delta
+	}
+	refTime := time.Time{}.Add(time.Duration(referenceTime) * 64 * time.Millisecond)
 	recvDeltas := feedback.RecvDeltas
+	// PacketStatusCount is the number of packets the feedback reports on;
+	// symbols beyond it are padding.
+	remaining := feedback.PacketStatusCount
 
 	for _, chunk := range feedback.PacketChunks {
+		if remaining == 0 {
+			break
+		}
 		switch chunk := chunk.(type) {
 		case *rtcp.RunLengthChunk:
-			n, nextRefTime, acks, err := f.unpackRunLengthChunk(index, refTime, chunk, recvDeltas)
+			n, nextRefTime, statusCount, acks, err := f.unpackRunLengthChunk(index, refTime, chunk, recvDeltas, remaining)
 			if err != nil {
 				return nil, err
 			}
 			refTime = nextRefTime
 			result = append(result, acks...)
 			recvDeltas = recvDeltas[n:]
-			index += chunk.RunLength
+			index += statusCount
+			remaining -= statusCount
 		case *rtcp.StatusVectorChunk:
-			n, nextRefTime, acks, err := f.unpackStatusVectorChunk(index, refTime, chunk, recvDeltas)
+			n, nextRefTime, statusCount, acks, err := f.unpackStatusVectorChunk(index, refTime, chunk, recvDeltas, remaining)
 			if err != nil {
 				return nil, err
 			}
 			refTime = nextRefTime
 			result = append(result, acks...)
 			recvDeltas = recvDeltas[n:]
-			index = uint16(int(index) + len(chunk.SymbolList)) //nolint:gosec // G115
+			index += statusCount
+			remaining -= statusCount
 		default:
 			return nil, errInvalidFeedback
 		}
 	}
 
-	// Retire only after the complete feedback was parsed successfully. Missing
-	// packets stay available for a later received report after reordering.
+	// Commit history changes only after the complete feedback is valid.
 	for _, ack := range result {
 		key := feedbackHistoryKey{ssrc: ack.SSRC, sequenceNumber: ack.SequenceNumber}
 		if !ack.Arrival.IsZero() {
@@ -202,6 +231,10 @@ func (f *FeedbackAdapter) OnTransportCCFeedback(
 		} else {
 			f.history.markLost(key)
 		}
+	}
+	if feedback.PacketStatusCount > 0 {
+		f.referenceTime = referenceTime
+		f.referenceTimeInitialized = true
 	}
 
 	return result, nil
@@ -325,4 +358,21 @@ func (f *feedbackHistory) removeOldest() {
 			delete(f.items, key)
 		}
 	}
+}
+
+func (f *feedbackHistory) twccInRange(start, count uint16) []Acknowledgment {
+	acks := []Acknowledgment{}
+	for key := range f.items {
+		if key.ssrc == 0 && key.sequenceNumber-start < count {
+			if ack, ok := f.get(key); ok {
+				ack.Arrival = time.Time{}
+				acks = append(acks, ack)
+			}
+		}
+	}
+	slices.SortFunc(acks, func(a, b Acknowledgment) int {
+		return int(a.SequenceNumber-start) - int(b.SequenceNumber-start)
+	})
+
+	return acks
 }

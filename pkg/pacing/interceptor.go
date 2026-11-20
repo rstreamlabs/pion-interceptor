@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/internal/rtpbuffer"
 	"github.com/pion/logging"
 	"github.com/pion/rtp"
 )
@@ -35,7 +36,7 @@ type Option func(*Interceptor) error
 // the interceptor factory.
 func InitialRate(rate int) Option {
 	return func(i *Interceptor) error {
-		i.initialRate = rate
+		i.rate = rate
 
 		return nil
 	}
@@ -109,19 +110,21 @@ func (f *InterceptorFactory) NewInterceptor(id string) (interceptor.Interceptor,
 	defer f.lock.Unlock()
 
 	interceptor := &Interceptor{
-		NoOp:        interceptor.NoOp{},
-		initialRate: 1_000_000,
-		interval:    5 * time.Millisecond,
-		queueSize:   1_000_000,
+		NoOp:      interceptor.NoOp{},
+		interval:  5 * time.Millisecond,
+		queueSize: 1_000_000,
 		pacerFactory: func(initialRate, burst int) pacer {
 			return newRateLimitPacer(initialRate, burst)
 		},
-		limit:   nil,
-		queue:   nil,
-		closed:  make(chan struct{}),
-		wg:      sync.WaitGroup{},
-		id:      id,
-		onClose: f.remove,
+		limit:    nil,
+		queue:    nil,
+		rateLock: sync.Mutex{},
+		rate:     1_000_000,
+		mtu:      1500,
+		closed:   make(chan struct{}),
+		wg:       sync.WaitGroup{},
+		id:       id,
+		onClose:  f.remove,
 	}
 	for _, opt := range f.opts {
 		if err := opt(interceptor); err != nil {
@@ -133,8 +136,8 @@ func (f *InterceptorFactory) NewInterceptor(id string) (interceptor.Interceptor,
 	}
 	interceptor.log = interceptor.loggerFactory.NewLogger("pacer_interceptor")
 	interceptor.limit = interceptor.pacerFactory(
-		interceptor.initialRate,
-		burst(interceptor.initialRate, interceptor.interval),
+		interceptor.rate,
+		burst(interceptor.rate, interceptor.interval, 8*interceptor.mtu),
 	)
 	interceptor.queue = make(chan packet, interceptor.queueSize)
 
@@ -157,14 +160,18 @@ type Interceptor struct {
 	loggerFactory logging.LoggerFactory
 
 	// config
-	initialRate  int
 	interval     time.Duration
 	queueSize    int
 	pacerFactory pacerFactory
 
 	// limiter and queue
-	limit pacer
-	queue chan packet
+	limit     pacer
+	queue     chan packet
+	queueLock sync.Mutex
+
+	rateLock sync.Mutex
+	rate     int
+	mtu      int
 
 	// shutdown
 	closed  chan struct{}
@@ -173,19 +180,37 @@ type Interceptor struct {
 	onClose func(string)
 }
 
-// burst calculates the minimal burst size required to reach the given rate and
-// pacing interval.
-func burst(rate int, interval time.Duration) int {
+// burst calculates the burst size required to reach the given rate at the
+// given pacing interval. It is one interval's worth of tokens plus minBurst
+// bits of headroom, so that a packet of minBurst bits can always be sent and
+// the tokens left over after a tick are carried into the next one instead of
+// being clamped away.
+func burst(rate int, interval time.Duration, minBurst int) int {
 	if interval <= 0 {
 		interval = time.Millisecond
 	}
 
-	return max(8*1500, int(float64(rate)*interval.Seconds()))
+	return minBurst + int(float64(rate)*interval.Seconds())
 }
 
 // setRate updates the pacing rate and burst of the rate limiter.
 func (i *Interceptor) setRate(r int) {
-	i.limit.SetRate(r, burst(r, i.interval))
+	i.rateLock.Lock()
+	defer i.rateLock.Unlock()
+
+	i.rate = r
+	i.limit.SetRate(r, burst(r, i.interval, 8*i.mtu))
+}
+
+func (i *Interceptor) growMTU(bytes int) {
+	i.rateLock.Lock()
+	defer i.rateLock.Unlock()
+
+	if bytes <= i.mtu {
+		return
+	}
+	i.mtu = bytes
+	i.limit.SetRate(i.rate, burst(i.rate, i.interval, 8*bytes))
 }
 
 // BindLocalStream implements interceptor.Interceptor.
@@ -198,20 +223,30 @@ func (i *Interceptor) BindLocalStream(
 		payload []byte,
 		attributes interceptor.Attributes,
 	) (int, error) {
+		i.queueLock.Lock()
+		defer i.queueLock.Unlock()
+		select {
+		case <-i.closed:
+			return 0, errPacerClosed
+		default:
+		}
+		resend, _ := attributes[rtpbuffer.ResendKey{}].(*rtpbuffer.Resend)
 		hdr := header.Clone()
 		pay := make([]byte, len(payload))
 		copy(pay, payload)
 		attr := maps.Clone(attributes)
+		resend.Retain()
 		select {
 		case i.queue <- packet{
 			writer:     writer,
 			header:     &hdr,
 			payload:    pay,
 			attributes: attr,
+			resend:     resend,
 		}:
-		case <-i.closed:
-			return 0, errPacerClosed
 		default:
+			resend.Release(false)
+
 			return 0, errPacerOverflow
 		}
 
@@ -221,9 +256,16 @@ func (i *Interceptor) BindLocalStream(
 
 // Close implements interceptor.Interceptor.
 func (i *Interceptor) Close() error {
-	defer i.wg.Wait()
-	close(i.closed)
-	i.onClose(i.id)
+	i.queueLock.Lock()
+	select {
+	case <-i.closed:
+	default:
+		close(i.closed)
+		close(i.queue)
+		i.onClose(i.id)
+	}
+	i.queueLock.Unlock()
+	i.wg.Wait()
 
 	return nil
 }
@@ -232,22 +274,38 @@ func (i *Interceptor) loop() {
 	ticker := time.NewTicker(i.interval)
 	defer ticker.Stop()
 	queue := make([]packet, 0)
+	defer func() { i.releaseQueue(queue) }()
 	for {
 		select {
 		case now := <-ticker.C:
-			for len(queue) > 0 && i.limit.Budget(now) > 8*float64(queue[0].len()) {
-				i.limit.AllowN(now, 8*queue[0].len())
-				var next packet
-				next, queue = queue[0], queue[1:]
-				if _, err := next.writer.Write(next.header, next.payload, next.attributes); err != nil {
+			for len(queue) > 0 && i.limit.Budget(now) >= 8*float64(queue[0].len()) {
+				next := queue[0]
+				i.limit.AllowN(now, 8*next.len())
+				_, err := next.writer.Write(next.header, next.payload, next.attributes)
+				if err != nil {
 					i.log.Warnf("error on writing RTP packet: %v", err)
 				}
+				queue[0], queue = packet{}, queue[1:]
+				next.resend.Release(err == nil)
 			}
-		case pkt := <-i.queue:
+		case pkt, ok := <-i.queue:
+			if !ok {
+				return
+			}
+			i.growMTU(pkt.len())
 			queue = append(queue, pkt)
 		case <-i.closed:
 			return
 		}
+	}
+}
+
+func (i *Interceptor) releaseQueue(queue []packet) {
+	for _, pkt := range queue {
+		pkt.resend.Release(false)
+	}
+	for pkt := range i.queue {
+		pkt.resend.Release(false)
 	}
 }
 
@@ -256,6 +314,7 @@ type packet struct {
 	header     *rtp.Header
 	payload    []byte
 	attributes interceptor.Attributes
+	resend     *rtpbuffer.Resend
 }
 
 func (p *packet) len() int {
